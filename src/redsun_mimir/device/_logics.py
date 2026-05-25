@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
 from ophyd_async.core import (
-    DetectorArmLogic,
+    DetectorAcquireLogic,
     DetectorDataLogic,
     DetectorTriggerLogic,
     StreamResourceDataProvider,
@@ -62,45 +62,37 @@ class BaseTriggerLogic(DetectorTriggerLogic):
 
 
 @dataclass
-class BaseArmLogic(DetectorArmLogic, Loggable):
-    datakey_name: str
-    writer: DataWriter
-    write_sig: SignalRW[bool]
-
+class BaseAcquireLogic(DetectorAcquireLogic, Loggable):
     _pump_task: asyncio.Task[None] | None = field(default=None, init=False)
-    _stop_event: asyncio.Event = field(init=False)
+    _arm_event: asyncio.Event = field(init=False)
+    _disarm_event: asyncio.Event = field(init=False)
+    _idle_event: asyncio.Event = field(init=False)
 
     def __post_init__(self) -> None:
-        async def _make_event() -> asyncio.Event:
-            return asyncio.Event()
+        async def _make_event() -> tuple[asyncio.Event, asyncio.Event, asyncio.Event]:
+            return asyncio.Event(), asyncio.Event(), asyncio.Event()
 
-        self._stop_event = run_coro(_make_event())
+        self._arm_event, self._disarm_event, self._idle_event = run_coro(_make_event())
 
-    async def arm(self) -> None:
-        await self._start_acquisition()
-        self._stop_event.clear()
+    async def ensure_ready(self) -> None:
+        await super().ensure_ready()
+        self._arm_event.clear()
+        self._disarm_event.clear()
+        self._idle_event.clear()
         self._pump_task = asyncio.create_task(self._pump())
 
-    async def wait_for_idle(self) -> None: ...
+    async def start_acquiring(self) -> None:
+        self._arm_event.set()
 
-    async def disarm(self, on_unstage: bool) -> None:
-        if not self._stop_event.is_set():
-            self._stop_event.set()
+    async def wait_for_idle(self) -> None:
+        # TODO: idle event should be waited here,
+        # but i'm not sure if the event is even needed
+        ...
+
+    async def ensure_stopped(self) -> None:
         if self._pump_task is not None:
+            self._disarm_event.set()
             await self._pump_task
-            self._pump_task = None
-        await self._stop_acquisition()
-        await self.write_sig.set(False)
-        if self.writer.is_open:
-            self.writer.unregister(self.datakey_name)
-            if len(self.writer.sources) == 0:
-                self.writer.close(reset_path=on_unstage)
-
-    @abc.abstractmethod
-    async def _start_acquisition(self) -> None: ...
-
-    @abc.abstractmethod
-    async def _stop_acquisition(self) -> None: ...
 
     @abc.abstractmethod
     async def _pump(self) -> None: ...
@@ -111,22 +103,59 @@ class BaseDataLogic(DetectorDataLogic, Loggable):
     writer: DataWriter
     path_provider: PathProvider
 
+    _drain_task: asyncio.Task[None] | None = field(default=None, init=False)
+    _drain_ready_event: asyncio.Event = field(init=False)
+
+    def __post_init__(self) -> None:
+        async def _make_event() -> asyncio.Event:
+            return asyncio.Event()
+
+        self._drain_ready_event = run_coro(_make_event())
+        self._store_path = ""
+
+    def close_writer_if_idle(self) -> None:
+        """Close the writer if all datakeys have been unregistered."""
+        if len(self.writer.sources) == 0 and self.writer.is_open:
+            self.writer.close(reset_path=True)
+            self._store_path = ""
+
+    def get_store_path(self) -> str:
+        """Get the current store path of the writer.
+
+        Returns
+        -------
+            str: The current DataWriter store path.
+        """
+        path = self.writer.get_store_path()
+        if path is None:
+            raise RuntimeError("Writer path is not set.")
+        return str(path)
+
     def get_hinted_fields(self, datakey_name: str) -> Sequence[str]:
         return [datakey_name]
 
     async def prepare_unbounded(self, datakey_name: str) -> StreamableDataProvider:
-        path_info = self.path_provider(datakey_name)
         extension = self.writer.file_extension
         if not self.writer.is_path_set():
+            # resolve the path if not set
+            path_info = self.path_provider(datakey_name)
             write_path = path_info.directory_path / ".".join(
                 [path_info.filename, extension]
             )
             self.writer.set_store_path(write_path)
+            self._store_path = str(write_path)
             self.logger.debug(f"Writer path set to {write_path}")
+        else:
+            # reuse the existing path
+            self._store_path = self.get_store_path()
 
         shape = self.writer.sources[datakey_name].shape
         capacity = self.writer.sources[datakey_name].capacity
         dtype_numpy = np.dtype(self.writer.sources[datakey_name].dtype_numpy).str
+
+        self._drain_task = asyncio.create_task(self._drain(datakey_name))
+
+        await self._drain_ready_event.wait()
 
         # when unlimited capacity is requested, the time axis of
         # shape requires a None flag to indicate it grows indefinetely
@@ -140,13 +169,18 @@ class BaseDataLogic(DetectorDataLogic, Loggable):
             parameters={},
         )
 
-        # TODO: this seems to be used primarely for
-        # HDF5 files; maybe a custom provider could be
-        # implemented for Zarr
         sig = self.writer.get_counter(datakey_name)
         return StreamResourceDataProvider(
-            uri=f"{path_info.directory_path}{path_info.filename}.{extension}",
+            uri=self._store_path,
             resources=[data_resource],
             mimetype=self.writer.mimetype,
             collections_written_signal=sig,
         )
+
+    async def stop(self) -> None:
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            await self._drain_task
+
+    @abc.abstractmethod
+    async def _drain(self, datakey_name: str) -> None: ...

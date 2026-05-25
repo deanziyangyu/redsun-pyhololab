@@ -12,6 +12,7 @@ from ophyd_async.core import (
     soft_signal_r_and_setter,
     soft_signal_rw,
 )
+from redsun.aio import run_coro
 from redsun.device import DeviceMap
 from redsun.log import Loggable
 from serial import Serial
@@ -175,7 +176,9 @@ class UC2LaserDevice(StandardReadable, Loggable):
             await self.intensity.set(self._current_intensity)
         await self.enabled.set(not enabled)
 
-    async def shutdown(self) -> None: ...
+    async def shutdown(self) -> None:
+        await self.intensity.set(0)
+        await self.enabled.set(False)
 
 
 class UC2MotorDevice(StandardReadable, Loggable):
@@ -207,5 +210,12 @@ class UC2MotorDevice(StandardReadable, Loggable):
             }
         )
         super().__init__(name)
+        run_coro(self._set_zero())
 
     async def shutdown(self) -> None: ...
+
+    async def _set_zero(self) -> None:
+        """Set all axes to zero."""
+        await self.x.set(0)
+        await self.y.set(0)
+        await self.z.set(0)

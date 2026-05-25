@@ -4,11 +4,18 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from redsun_mimir.device._common import BaseArmLogic, BaseDataLogic, BaseTriggerLogic
+from redsun.log import Loggable
+
+from redsun_mimir.device._logics import (
+    BaseAcquireLogic,
+    BaseDataLogic,
+    BaseTriggerLogic,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from ophyd_async.core import SignalRW
     from pymmcore_plus import CMMCorePlus as Core
 
     from redsun_mimir.protocols import Array2D
@@ -19,39 +26,53 @@ class MMTriggerLogic(BaseTriggerLogic): ...
 
 
 @dataclass
-class MMArmLogic(BaseArmLogic):
+class MMAcquireLogic(BaseAcquireLogic):
     core: Core
     set_buffer: Callable[[Array2D], None]
-
-    async def _start_acquisition(self) -> None:
-        self.core.startContinuousSequenceAcquisition()
-
-    async def _stop_acquisition(self) -> None:
-        if self.core.isSequenceRunning():
-            self.core.stopSequenceAcquisition()
+    queue: asyncio.Queue[Array2D]
 
     async def _pump(self) -> None:
-        exposure_ms = self.core.getExposure()
-        sleep_s = exposure_ms / 1000.0
-        capacity = self.writer.sources[self.datakey_name].capacity
+        sleep_s = self.core.getExposure() / 1000.0
+
+        await self._arm_event.wait()
+
+        self.core.startContinuousSequenceAcquisition()
+        while not self._disarm_event.is_set():
+            if self.core.getRemainingImageCount() < 1:
+                await asyncio.sleep(sleep_s)
+            else:
+                img = self.core.popNextImage()
+                self.set_buffer(img)
+                self.queue.put_nowait(img)
+        self.core.stopSequenceAcquisition()
+
+
+@dataclass
+class MMDataLogic(BaseDataLogic, Loggable):
+    write_sig: SignalRW[bool]
+    queue: asyncio.Queue[Array2D]
+
+    async def _drain(self, datakey_name: str) -> None:
+        capacity = self.writer.sources[datakey_name].capacity
         frame_cnt = 0
         write_forever = capacity == 0
-        while not self._stop_event.is_set():
-            while self.core.getRemainingImageCount() < 1:
-                await asyncio.sleep(sleep_s)
-            img = self.core.popNextImage()
-            self.set_buffer(img)
-            if await self.write_sig.get_value():
-                if not self.writer.is_open:
-                    self.writer.open()
-                if write_forever or frame_cnt < capacity:
-                    self.writer.write(self.datakey_name, img)
-                    frame_cnt = await self.writer.get_counter(
-                        self.datakey_name
-                    ).get_value()
-                    self.logger.debug(
-                        f"Frame count updated for {self.datakey_name}: {frame_cnt}"
-                    )
-
-
-class MMDataLogic(BaseDataLogic): ...
+        self._drain_ready_event.set()
+        try:
+            while True:
+                img = await self.queue.get()
+                if await self.write_sig.get_value():
+                    if not self.writer.is_open:
+                        self.writer.open()
+                    if write_forever or frame_cnt < capacity:
+                        self.writer.write(datakey_name, img)
+                        frame_cnt += 1
+                        self.logger.debug(f"Frame {frame_cnt} written to disk.")
+                    else:
+                        # capacity reached, regardless of the
+                        # value of close event, exit
+                        break
+        except asyncio.CancelledError:
+            ...
+        finally:
+            self.writer.unregister(datakey_name)
+            self.close_writer_if_idle()

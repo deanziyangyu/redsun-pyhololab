@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from ophyd_async.core import (
@@ -7,6 +8,7 @@ from ophyd_async.core import (
     soft_signal_rw,
 )
 from pymmcore_plus import CMMCorePlus
+from redsun.aio import run_coro
 from redsun.log import Loggable
 from redsun.storage import create_writer
 
@@ -20,10 +22,12 @@ from ._backend import (
     mm_roi_signal,
 )
 from ._common import MMAdapterInfo
-from ._logics import MMArmLogic, MMDataLogic, MMTriggerLogic
+from ._logics import MMAcquireLogic, MMDataLogic, MMTriggerLogic
 
 if TYPE_CHECKING:
     from ophyd_async.core import SignalRW
+
+    from redsun_mimir.protocols import Array2D
 
 
 class MMBaseCameraDevice(StandardDetector, Loggable):
@@ -60,11 +64,12 @@ class MMBaseCameraDevice(StandardDetector, Loggable):
         self.core.initializeDevice(name)
         self.core.setCameraDevice(name)
         self.writer = create_writer(writer)
+        self.path_provider = get_path_provider()
         self.core.clearROI()
 
         # for simplicity, hardcode
-        # the default exposure time to 50 ms
-        self.core.setExposure(50.0)
+        # the default exposure time to 100 ms
+        self.core.setExposure(100.0)
         self.exposure = mm_exposure_signal(self.core, name)
         self.roi = mm_roi_signal(self.core, name)
         self.pixel_dtype = pixel_dtype
@@ -79,19 +84,28 @@ class MMBaseCameraDevice(StandardDetector, Loggable):
             dtype=pixel_dtype,
         )
 
-        arm_logic = MMArmLogic(
-            datakey_name=name,
+        async def _make_queue(size: int) -> asyncio.Queue[Array2D]:
+            return asyncio.Queue(maxsize=size)
+
+        # TODO: make the queue size configurable
+        queue = run_coro(_make_queue(100))
+
+        acquire_logic = MMAcquireLogic(
             core=self.core,
-            writer=self.writer,
             set_buffer=setter,
-            write_sig=self.write_sig,
+            queue=queue,
         )
 
-        data_logic = MMDataLogic(writer=self.writer, path_provider=get_path_provider())
+        data_logic = MMDataLogic(
+            writer=self.writer,
+            write_sig=self.write_sig,
+            queue=queue,
+            path_provider=self.path_provider,
+        )
 
-        logics: list[MMTriggerLogic | MMArmLogic | MMDataLogic] = [
+        logics: list[MMTriggerLogic | MMAcquireLogic | MMDataLogic] = [
             trigger_logic,
-            arm_logic,
+            acquire_logic,
             data_logic,
         ]
 
@@ -107,8 +121,6 @@ class MMDemoCamera(MMBaseCameraDevice):
         # numpy to adapter dtype mapping
         pixel_dtype: dict[str, str] = {
             "uint8": "8bit",
-            "uint16": "16bit",
-            "uint32": "32bit",
         }
         self.core = CMMCorePlus.instance()
         self.pixel_dtype = mm_property_signal(
@@ -122,13 +134,14 @@ class MMDemoCamera(MMBaseCameraDevice):
             adapter_info=adapter_info,
             writer=writer,
         )
+        self.core.setProperty(name, "PixelType", "8bit")
 
         self.median = MedianDevice(
             parent_name=name,
             roi_sig=self.roi,
             dtype_sig=self.pixel_dtype,
-            writer=create_writer(writer),
-            path_provider=get_path_provider(),
+            writer=self.writer,
+            path_provider=self.path_provider,
         )
 
 
@@ -139,7 +152,6 @@ class MMDahengCamera(MMBaseCameraDevice):
         # numpy to adapter dtype mapping
         pixel_dtype: dict[str, str] = {
             "uint8": "Mono8",
-            "uint16": "Mono16",
         }
         self.core = CMMCorePlus.instance()
         self.pixel_dtype = mm_property_signal(
@@ -153,13 +165,14 @@ class MMDahengCamera(MMBaseCameraDevice):
             adapter_info=adapter_info,
             writer=writer,
         )
+        self.core.setProperty(name, "PixelType", "Mono8")
 
         self.median = MedianDevice(
             parent_name=name,
             roi_sig=self.roi,
             dtype_sig=self.pixel_dtype,
-            writer=create_writer(writer),
-            path_provider=get_path_provider(),
+            writer=self.writer,
+            path_provider=self.path_provider,
         )
 
 class MMHamamatsuCamera(MMBaseCameraDevice):

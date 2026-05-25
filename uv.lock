@@ -2149,7 +2149,7 @@ wheels = [
 
 [[package]]
 name = "ophyd-async"
-version = "0.17a3"
+version = "0.17a5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "bluesky" },
@@ -2163,9 +2163,9 @@ dependencies = [
     { name = "stamina" },
     { name = "velocity-profile" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c1/22/ee6c7f4029195325fedcd1730233cacb78ac878b89f443d9d37f7c9647d5/ophyd_async-0.17a3.tar.gz", hash = "sha256:0f1f83b66862269aacb120c230da83b28b121c3c682d0009320fe82ff2072a25", size = 555077, upload-time = "2026-04-17T11:13:05.658Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1d/3c/127aeba71467a5dab69d21cbdcc7a7dfe294e826f6883af0b741ace01dbe/ophyd_async-0.17a5.tar.gz", hash = "sha256:f0eb30de946148479a1e33822e535542f47da0d9854da7d5ffa579990f650508", size = 557024, upload-time = "2026-05-20T08:21:08.682Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ae/ed/5b699ab3c949be4847b9538344c24a9c4ee9ad03ca0df102f6aa182b1855/ophyd_async-0.17a3-py3-none-any.whl", hash = "sha256:2d2367f00b8517122f2dcfe87327efb6ba3a34e88110a45969e0b4ca7cb5b349", size = 207512, upload-time = "2026-04-17T11:13:04.099Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/a7/a87c4f373082674d2429af6912d2b0c113269063ee089eeb400effcc6bb6/ophyd_async-0.17a5-py3-none-any.whl", hash = "sha256:8175483b6ce5823cc3aff358afdd370bc08e1b2caf9f9e0cc4af9dc5b1802d8b", size = 208907, upload-time = "2026-05-20T08:21:06.899Z" },
 ]
 
 [[package]]
@@ -3243,7 +3243,7 @@ wheels = [
 
 [[package]]
 name = "redsun"
-version = "0.10.0rc4"
+version = "0.10.0rc5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "bluesky" },
@@ -3254,9 +3254,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8d/c5/ed99231c8330f4380a4366c8b6169e7f663f9550de98e7437e44a670b1d6/redsun-0.10.0rc4.tar.gz", hash = "sha256:70cbae846375a8de96fb956b502dd161a104e6f03ae8435b062bc178d06c679a", size = 57600, upload-time = "2026-04-28T14:31:20.053Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3f/6b/17c90a4f03894d2ef893be41f1848b557b2f6e49df33270b9883bf2133e8/redsun-0.10.0rc5.tar.gz", hash = "sha256:4b4188579aa4e15d11210f507c98515db287334ae28155b204b6accb0924fe06", size = 57635, upload-time = "2026-05-22T14:52:56.631Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/d7/1a924e5f212f1e5ea917a28ed92b2698fe68b4dd64e656c4721e4cfc0783/redsun-0.10.0rc4-py3-none-any.whl", hash = "sha256:341d3affb4fb30913e5505ec85b6c4e002b50afffc882a16a4b5cf7403afc597", size = 75535, upload-time = "2026-04-28T14:31:18.545Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/23/167466de565a2fae56f4b500fdb418e2a7c04391a7066621ddabf45e2d61/redsun-0.10.0rc5-py3-none-any.whl", hash = "sha256:1a36d95e6c7a20e4f9f2f632ad553cfbb3f11de2ac050b10d840383515f04e8f", size = 75582, upload-time = "2026-05-22T14:52:54.947Z" },
 ]
 
 [package.optional-dependencies]
@@ -3280,6 +3280,7 @@ source = { editable = "." }
 dependencies = [
     { name = "msgspec" },
     { name = "napari" },
+    { name = "ophyd-async" },
     { name = "redsun", extra = ["zarr"] },
 ]
 
@@ -3337,13 +3338,14 @@ requires-dist = [
     { name = "napari", extras = ["pyqt6"], marker = "extra == 'pyqt'", specifier = ">=0.6.6" },
     { name = "napari", extras = ["pyqt6"], marker = "extra == 'sim'", specifier = ">=0.6.6" },
     { name = "napari", extras = ["pyside6"], marker = "extra == 'pyside'", specifier = ">=0.6.6" },
+    { name = "ophyd-async", specifier = ">=0.17a5" },
     { name = "pymmcore-plus", marker = "extra == 'sim'", specifier = ">=0.18.1" },
     { name = "pymmcore-plus", marker = "extra == 'uc2'", specifier = ">=0.16.0" },
     { name = "pyserial", marker = "extra == 'uc2'", specifier = ">=3.5" },
     { name = "redsun", extras = ["pyqt"], marker = "extra == 'pyqt'" },
     { name = "redsun", extras = ["pyqt"], marker = "extra == 'sim'" },
     { name = "redsun", extras = ["pyside"], marker = "extra == 'pyside'" },
-    { name = "redsun", extras = ["zarr"], specifier = ">=0.10.0rc4" },
+    { name = "redsun", extras = ["zarr"], specifier = ">=0.10.0rc5" },
 ]
 provides-extras = ["pyqt", "pyside", "sim", "uc2"]
 
