@@ -354,7 +354,7 @@ class MMCorePositionSignalBackend(SignalBackend[float]):
             sig.connect(on_change)
 
 
-def `                                                                                                                                                                                                                                                                                                                                                                                   mm_property_signal(
+def mm_property_signal(
     core: Core,
     device_label: str,
     property_name: str,

@@ -198,6 +198,7 @@ class MMHamamatsuCamera(MMBaseCameraDevice):
             parent_name=name,
             roi_sig=self.roi,
             dtype_sig=self.pixel_dtype,
-            writer=create_writer(writer),
-            path_provider=get_path_provider(),
+            writer=self.writer,
+            path_provider=self.path_provider,
+            store_path_sig=self.store_path_sig
         )
