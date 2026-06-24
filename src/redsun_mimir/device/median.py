@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import TYPE_CHECKING
 
-from ophyd_async.core import StandardDetector, TriggerInfo, soft_signal_rw
+import numpy as np
+from ophyd_async.core import (
+    StandardDetector,
+    StreamResourceDataProvider,
+    StreamResourceInfo,
+    TriggerInfo,
+    soft_signal_rw,
+)
 from redsun.aio import run_coro
 from redsun.log import Loggable
 from redsun.storage import SourceInfo
@@ -17,7 +25,7 @@ from redsun_mimir.device._logics import (
 from redsun_mimir.device.signals import writeable_buffer_signal
 
 if TYPE_CHECKING:
-    from ophyd_async.core import PathProvider, SignalRW
+    from ophyd_async.core import PathProvider, SignalRW, StreamableDataProvider
     from redsun.storage import DataWriter
 
     from redsun_mimir.protocols import Array2D, ROIType
@@ -50,14 +58,18 @@ class MedianAcquireLogic(BaseAcquireLogic):
     buffer_ready: SignalRW[bool]
     queue: asyncio.Queue[Array2D]
 
-    async def _pump(self) -> None:
+    async def pump(self) -> None:
+        """Send the buffered frame to the queue when ready."""
         try:
-            await self._arm_event.wait()
-            while not await self.buffer_ready.get_value():
-                await asyncio.sleep(0)
-            self.queue.put_nowait(await self.buffer.get_value())
-            await self.buffer_ready.set(False)
-            await self._disarm_event.wait()
+            await self._arm_event
+
+            buffer_ready = await self.buffer_ready.get_value()
+            if buffer_ready:
+                # we actually have something to write to disk;
+                # put it in the queue
+                self.queue.put_nowait(await self.buffer.get_value())
+                await self.buffer_ready.set(False)
+            await self._disarm_event
         except asyncio.CancelledError:
             ...
         finally:
@@ -73,6 +85,46 @@ class MedianDataLogic(BaseDataLogic, Loggable):
 
     write_sig: SignalRW[bool]
     queue: asyncio.Queue[Array2D]
+    store_path_sig: SignalRW[str]
+
+    async def should_allocate_path(self) -> bool:
+        """Return False to defer path allocation to the camera write phase."""
+        return False
+
+    async def prepare_unbounded(self, datakey_name: str) -> StreamableDataProvider:
+        """Prepare the data provider for the median device.
+
+        Always act as secondary: read the store path from the shared writer.
+        """
+        store_path = await self.store_path_sig.get_value()
+        if not store_path:
+            raise RuntimeError(
+                "store_path_sig is empty — ensure the camera write phase "
+                "ran before preparing the median."
+            )
+        self._store_path = store_path
+        self.writer.set_store_path(PurePath(store_path))
+
+        shape = self.writer.sources[datakey_name].shape
+        capacity = self.writer.sources[datakey_name].capacity
+        dtype_numpy = np.dtype(self.writer.sources[datakey_name].dtype_numpy).str
+        self._drain_task = asyncio.create_task(self._drain(datakey_name))
+        await self._drain_ready_event
+        actual_capacity = capacity if capacity > 0 else None
+        data_resource = StreamResourceInfo(
+            data_key=datakey_name,
+            shape=(actual_capacity, *shape),
+            chunk_shape=shape,
+            dtype_numpy=dtype_numpy,
+            parameters={},
+        )
+        sig = self.writer.get_counter(datakey_name)
+        return StreamResourceDataProvider(
+            uri=self._store_path,
+            resources=[data_resource],
+            mimetype=self.writer.mimetype,
+            collections_written_signal=sig,
+        )
 
     async def _drain(self, datakey_name: str) -> None:
         self._drain_ready_event.set()
@@ -102,6 +154,7 @@ class MedianDevice(StandardDetector):
         parent_name: str,
         roi_sig: SignalRW[ROIType],
         dtype_sig: SignalRW[str],
+        store_path_sig: SignalRW[str],
         writer: DataWriter,
         path_provider: PathProvider,
     ) -> None:
@@ -131,6 +184,7 @@ class MedianDevice(StandardDetector):
             writer=self.writer,
             path_provider=path_provider,
             write_sig=self.write_sig,
+            store_path_sig=store_path_sig,
             queue=queue,
         )
 

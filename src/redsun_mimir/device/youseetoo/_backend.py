@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import TYPE_CHECKING
 
@@ -12,6 +13,7 @@ from redsun_mimir.device._logics import DEFAULT_TIMEOUT
 from ._actions import Acknowledge, LaserAction, MotorAction, MotorResponse
 
 if TYPE_CHECKING:
+    from threading import Lock
     from typing import ClassVar, Final
 
     from bluesky.protocols import Reading
@@ -43,7 +45,8 @@ class UC2AxisSignalBackend(SignalBackend[float]):
         "mm": MM_TO_NM,
     }
 
-    def __init__(self, serial: Serial, axis: AxisType, units: str) -> None:
+    def __init__(self, serial: Serial, axis: AxisType, units: str, lock: Lock) -> None:
+        self.lock = lock
         self.axis = axis
         self.units = units
         self.serial = serial
@@ -61,7 +64,7 @@ class UC2AxisSignalBackend(SignalBackend[float]):
     async def put(self, value: float | None) -> None:
         """Write *value* to the MM property."""
         if value is not None:
-            await self._send_cmd(value)
+            await asyncio.to_thread(self._send_cmd, value)
             self._current_position = value
 
     async def get_value(self) -> float:
@@ -92,65 +95,74 @@ class UC2AxisSignalBackend(SignalBackend[float]):
         # TODO: implement... how?
         ...
 
-    async def _send_cmd(self, value: float) -> None:
-        steps = int(value * self._factor / MOTOR_STEP)
-        action = MotorAction(
-            movement=MotorAction.generate_movement(id=self._axis_id, position=steps),
-            qid=self._axis_id,
-        )
-        packet = msgspec.json.encode(action)
-        written = self.serial.write(packet)
-
-        if written is None or written != len(packet):
-            raise RuntimeError("Failed to write to serial port.")
-        resp_str = (
-            str(self.serial.read_until(expected=b"--"))
-            .replace("+", "")
-            .replace("-", "")
-            .replace("\\r", "")
-            .replace("\\n", "")
-            .replace("b'", "")
-            .replace("'", "")
-        )
-        if not resp_str:
-            raise RuntimeError("Failed to read from serial port.")
-        try:
-            response = msgspec.json.decode(resp_str, type=Acknowledge)
-        except msgspec.DecodeError as e:
-            raise RuntimeError(f"Failed to decode response: {e}") from e
-        if response.qid != self._axis_id:
-            raise RuntimeError(f"Invalid response from motor. Received: {response}")
-
-        motor_resp_str = (
-            str(self.serial.read_until(expected=b"--"))
-            .replace("+", "")
-            .replace("-", "")
-            .replace("\\r", "")
-            .replace("\\n", "")
-            .replace("b'", "")
-            .replace("'", "")
-        )
-        if not motor_resp_str:
-            raise RuntimeError("Failed to read motor response from serial port.")
-
-        try:
-            motor_response = msgspec.json.decode(motor_resp_str, type=MotorResponse)
-        except msgspec.DecodeError as e:
-            raise RuntimeError(f"Failed to decode motor response: {e}") from e
-        if motor_response.qid != self._axis_id:
-            raise RuntimeError(
-                f"Invalid response from motor. Expected qid {self._axis_id}, "
-                f"but received {motor_response.qid}."
+    def _send_cmd(self, value: float) -> None:
+        with self.lock:
+            self.serial.reset_input_buffer()
+            steps = int(value * self._factor / MOTOR_STEP)
+            action = MotorAction(
+                movement=MotorAction.generate_movement(
+                    id=self._axis_id, position=steps
+                ),
+                qid=self._axis_id,
             )
-        self.serial.reset_input_buffer()
+            packet = msgspec.json.encode(action)
+            written = self.serial.write(packet)
+
+            if written is None or written != len(packet):
+                raise RuntimeError("Failed to write to serial port.")
+            resp_str = (
+                str(self.serial.read_until(expected=b"--"))
+                .replace("+", "")
+                .replace("-", "")
+                .replace("\\r", "")
+                .replace("\\n", "")
+                .replace("b'", "")
+                .replace("'", "")
+            )
+            if not resp_str:
+                raise RuntimeError("Failed to read from serial port.")
+            try:
+                response = msgspec.json.decode(resp_str, type=Acknowledge)
+            except msgspec.DecodeError as e:
+                raise RuntimeError(f"Failed to decode response: {e}") from e
+            if response.qid != self._axis_id:
+                raise RuntimeError(f"Invalid response from motor. Received: {response}")
+
+            motor_resp_str = (
+                str(self.serial.read_until(expected=b"--"))
+                .replace("+", "")
+                .replace("-", "")
+                .replace("\\r", "")
+                .replace("\\n", "")
+                .replace("b'", "")
+                .replace("'", "")
+            )
+            if not motor_resp_str:
+                raise RuntimeError("Failed to read motor response from serial port.")
+
+            try:
+                motor_response = msgspec.json.decode(motor_resp_str, type=MotorResponse)
+            except msgspec.DecodeError as e:
+                raise RuntimeError(f"Failed to decode motor response: {e}") from e
+            if motor_response.qid != self._axis_id:
+                raise RuntimeError(
+                    f"Invalid response from motor. Expected qid {self._axis_id}, "
+                    f"but received {motor_response.qid}."
+                )
 
 
 class UC2LaserSignalBackend(SignalBackend[int]):
     """Signal backend for a YouSeeToo laser."""
 
     def __init__(
-        self, serial: Serial, laser_id: int, units: str, range: tuple[int, int]
+        self,
+        serial: Serial,
+        laser_id: int,
+        units: str,
+        range: tuple[int, int],
+        lock: Lock,
     ) -> None:
+        self.lock = lock
         self.serial = serial
         self.id = laser_id
         self.qid = 1
@@ -168,7 +180,7 @@ class UC2LaserSignalBackend(SignalBackend[int]):
     async def put(self, value: int | None) -> None:
         """Write *value* to the MM property."""
         if value is not None:
-            await self._send_cmd(value)
+            await asyncio.to_thread(self._send_cmd, value)
             self._current_value = value
 
     async def get_value(self) -> int:
@@ -201,30 +213,33 @@ class UC2LaserSignalBackend(SignalBackend[int]):
         # TODO: implement... how?
         ...
 
-    async def _send_cmd(self, value: int) -> None:
-        action = LaserAction(id=self.id, qid=self.qid, value=value)
-        packet = msgspec.json.encode(action)
-        written = self.serial.write(packet)
-        if written is None or written != len(packet):
-            raise RuntimeError("Failed to write to serial port.")
-        resp_str = (
-            str(self.serial.read_until(expected=b"}"))
-            .replace("+", "")
-            .replace("-", "")
-            .replace("\\r", "")
-            .replace("\\n", "")
-            .replace("b'", "")
-            .replace("'", "")
-        )
-        if not resp_str:
-            raise RuntimeError("Failed to read from serial port.")
-        response = msgspec.json.decode(resp_str, type=Acknowledge)
-        if response.qid != self.qid:
-            raise RuntimeError(f"Invalid response from laser. Received: {response}")
-        self.serial.reset_input_buffer()
+    def _send_cmd(self, value: int) -> None:
+        with self.lock:
+            self.serial.reset_input_buffer()
+            action = LaserAction(id=self.id, qid=self.qid, value=value)
+            packet = msgspec.json.encode(action)
+            written = self.serial.write(packet)
+            if written is None or written != len(packet):
+                raise RuntimeError("Failed to write to serial port.")
+            resp_str = (
+                str(self.serial.read_until(expected=b"}"))
+                .replace("+", "")
+                .replace("-", "")
+                .replace("\\r", "")
+                .replace("\\n", "")
+                .replace("b'", "")
+                .replace("'", "")
+            )
+            if not resp_str:
+                raise RuntimeError("Failed to read from serial port.")
+            response = msgspec.json.decode(resp_str, type=Acknowledge)
+            if response.qid != self.qid:
+                raise RuntimeError(f"Invalid response from laser. Received: {response}")
 
 
-def uc2_axis_signal(serial: Serial, axis: AxisType, units: str) -> SignalRW[float]:
+def uc2_axis_signal(
+    serial: Serial, axis: AxisType, units: str, lock: Lock
+) -> SignalRW[float]:
     """Create a `SignalRW` for a YouSeeToo axis.
 
     Parameters
@@ -235,13 +250,15 @@ def uc2_axis_signal(serial: Serial, axis: AxisType, units: str) -> SignalRW[floa
         Axis to control. Must be one of "x", "y", or "z".
     units: str
         Units for the axis. Must be one of "nm", "um", or "mm".
+    lock: threading.Lock
+        Lock for synchronizing access to the serial port.
     """
-    backend = UC2AxisSignalBackend(serial, axis, units)
+    backend = UC2AxisSignalBackend(serial, axis, units, lock)
     return SignalRW(backend, name=f"{axis}_position", timeout=DEFAULT_TIMEOUT)
 
 
 def uc2_laser_signal(
-    serial: Serial, laser_id: int, units: str, range: tuple[int, int]
+    serial: Serial, laser_id: int, units: str, range: tuple[int, int], lock: Lock
 ) -> SignalRW[int]:
     """Create a `SignalRW` for a YouSeeToo laser.
 
@@ -255,6 +272,8 @@ def uc2_laser_signal(
         Units for the laser power. Must be "mW".
     range: tuple[int, int]
         Valid range for the laser power. E.g. (0, 1000) for 0-1000 mW.
+    lock: threading.Lock
+        Lock for synchronizing access to the serial port.
     """
-    backend = UC2LaserSignalBackend(serial, laser_id, units, range)
+    backend = UC2LaserSignalBackend(serial, laser_id, units, range, lock)
     return SignalRW(backend, name=f"laser_{laser_id}_power", timeout=DEFAULT_TIMEOUT)

@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
 
+import aiologic
 import numpy as np
 from ophyd_async.core import (
     DetectorAcquireLogic,
@@ -14,7 +15,6 @@ from ophyd_async.core import (
     StreamResourceInfo,
     TriggerInfo,
 )
-from redsun.aio import run_coro
 from redsun.log import Loggable
 from redsun.storage import SourceInfo
 
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 AxisType = Literal["x", "y", "z"]
 
-DEFAULT_TIMEOUT: Final[float] = 1.0
+DEFAULT_TIMEOUT: Final[float] = 5.0
 
 
 @dataclass
@@ -64,22 +64,18 @@ class BaseTriggerLogic(DetectorTriggerLogic):
 @dataclass
 class BaseAcquireLogic(DetectorAcquireLogic, Loggable):
     _pump_task: asyncio.Task[None] | None = field(default=None, init=False)
-    _arm_event: asyncio.Event = field(init=False)
-    _disarm_event: asyncio.Event = field(init=False)
-    _idle_event: asyncio.Event = field(init=False)
+    _arm_event: aiologic.REvent = field(init=False)
+    _disarm_event: aiologic.REvent = field(init=False)
 
     def __post_init__(self) -> None:
-        async def _make_event() -> tuple[asyncio.Event, asyncio.Event, asyncio.Event]:
-            return asyncio.Event(), asyncio.Event(), asyncio.Event()
-
-        self._arm_event, self._disarm_event, self._idle_event = run_coro(_make_event())
+        self._arm_event = aiologic.REvent()
+        self._disarm_event = aiologic.REvent()
 
     async def ensure_ready(self) -> None:
         await super().ensure_ready()
         self._arm_event.clear()
         self._disarm_event.clear()
-        self._idle_event.clear()
-        self._pump_task = asyncio.create_task(self._pump())
+        self._pump_task = asyncio.create_task(self.pump())
 
     async def start_acquiring(self) -> None:
         self._arm_event.set()
@@ -93,9 +89,11 @@ class BaseAcquireLogic(DetectorAcquireLogic, Loggable):
         if self._pump_task is not None:
             self._disarm_event.set()
             await self._pump_task
+            self._pump_task = None
+        self._disarm_event.clear()
 
     @abc.abstractmethod
-    async def _pump(self) -> None: ...
+    async def pump(self) -> None: ...
 
 
 @dataclass
@@ -104,20 +102,16 @@ class BaseDataLogic(DetectorDataLogic, Loggable):
     path_provider: PathProvider
 
     _drain_task: asyncio.Task[None] | None = field(default=None, init=False)
-    _drain_ready_event: asyncio.Event = field(init=False)
+    _drain_ready_event: aiologic.REvent = field(init=False)
 
     def __post_init__(self) -> None:
-        async def _make_event() -> asyncio.Event:
-            return asyncio.Event()
-
-        self._drain_ready_event = run_coro(_make_event())
+        self._drain_ready_event = aiologic.REvent()
         self._store_path = ""
 
     def close_writer_if_idle(self) -> None:
         """Close the writer if all datakeys have been unregistered."""
         if len(self.writer.sources) == 0 and self.writer.is_open:
-            self.writer.close(reset_path=True)
-            self._store_path = ""
+            self.writer.close(reset_path=False)
 
     def get_store_path(self) -> str:
         """Get the current store path of the writer.
@@ -134,19 +128,22 @@ class BaseDataLogic(DetectorDataLogic, Loggable):
     def get_hinted_fields(self, datakey_name: str) -> Sequence[str]:
         return [datakey_name]
 
+    async def should_allocate_path(self) -> bool:
+        """Return True if prepare_unbounded should call path_provider."""
+        return True
+
     async def prepare_unbounded(self, datakey_name: str) -> StreamableDataProvider:
         extension = self.writer.file_extension
         if not self.writer.is_path_set():
-            # resolve the path if not set
-            path_info = self.path_provider(datakey_name)
-            write_path = path_info.directory_path / ".".join(
-                [path_info.filename, extension]
-            )
-            self.writer.set_store_path(write_path)
-            self._store_path = str(write_path)
-            self.logger.debug(f"Writer path set to {write_path}")
+            if await self.should_allocate_path():
+                path_info = self.path_provider(datakey_name)
+                write_path = path_info.directory_path / ".".join(
+                    [path_info.filename, extension]
+                )
+                self.writer.set_store_path(write_path)
+                self._store_path = str(write_path)
+                self.logger.debug(f"Writer path set to {write_path}")
         else:
-            # reuse the existing path
             self._store_path = self.get_store_path()
 
         shape = self.writer.sources[datakey_name].shape
@@ -155,7 +152,8 @@ class BaseDataLogic(DetectorDataLogic, Loggable):
 
         self._drain_task = asyncio.create_task(self._drain(datakey_name))
 
-        await self._drain_ready_event.wait()
+        # wait until the drain loop is ready before returning the provider
+        await self._drain_ready_event
 
         # when unlimited capacity is requested, the time axis of
         # shape requires a None flag to indicate it grows indefinetely
@@ -181,6 +179,11 @@ class BaseDataLogic(DetectorDataLogic, Loggable):
         if self._drain_task is not None:
             self._drain_task.cancel()
             await self._drain_task
+            self._drain_task = None
+        self._drain_ready_event.clear()
+        if self.writer.is_path_set() and not self.writer.is_open:
+            self.writer.reset_store_path()
+            self._store_path = ""
 
     @abc.abstractmethod
     async def _drain(self, datakey_name: str) -> None: ...

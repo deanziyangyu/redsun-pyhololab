@@ -15,7 +15,8 @@ from redsun_mimir.device._logics import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from ophyd_async.core import SignalRW
+    import culsans
+    from ophyd_async.core import SignalRW, StreamableDataProvider
     from pymmcore_plus import CMMCorePlus as Core
 
     from redsun_mimir.protocols import Array2D
@@ -29,28 +30,49 @@ class MMTriggerLogic(BaseTriggerLogic): ...
 class MMAcquireLogic(BaseAcquireLogic):
     core: Core
     set_buffer: Callable[[Array2D], None]
-    queue: asyncio.Queue[Array2D]
+    queue: culsans.Queue[Array2D]
 
-    async def _pump(self) -> None:
-        sleep_s = self.core.getExposure() / 1000.0
+    def _acquisition_loop(self) -> None:
+        """Perform frame-grab loop in a separate thread."""
+        # sleep_s = self.core.getExposure() / 1000.0
+        # self.core.startContinuousSequenceAcquisition()
+        # while not self._disarm_event.is_set():
+        #     if self.core.getRemainingImageCount() < 1:
+        #         time.sleep(sleep_s)
+        #     else:
+        #         img = self.core.popNextImage()
+        #         self.set_buffer(img)
+        #         self.queue.sync_put(img)
+        # self.core.stopSequenceAcquisition()
 
-        await self._arm_event.wait()
-
-        self.core.startContinuousSequenceAcquisition()
+        # TODO: if anyone is reading this, i truly apologize:
+        # this shit is... shit; but there seems to be some
+        # problems when dealing with the mmcore sequence API
+        # and other devices, in particular with the daheng adapter;
+        # since this is a prototype and i'm out of time
+        # i don't have much of a choice for now... the loop above
+        # should be the correct one... maybe this is a problem specific
+        # to some adapters, no clue
         while not self._disarm_event.is_set():
-            if self.core.getRemainingImageCount() < 1:
-                await asyncio.sleep(sleep_s)
-            else:
-                img = self.core.popNextImage()
-                self.set_buffer(img)
-                self.queue.put_nowait(img)
-        self.core.stopSequenceAcquisition()
+            img = self.core.snap()
+            self.set_buffer(img)
+            self.queue.sync_put(img)
+
+    async def pump(self) -> None:
+        await self._arm_event
+        await asyncio.to_thread(self._acquisition_loop)
 
 
 @dataclass
 class MMDataLogic(BaseDataLogic, Loggable):
     write_sig: SignalRW[bool]
-    queue: asyncio.Queue[Array2D]
+    queue: culsans.Queue[Array2D]
+    store_path_sig: SignalRW[str]
+
+    async def prepare_unbounded(self, datakey_name: str) -> StreamableDataProvider:
+        provider = await super().prepare_unbounded(datakey_name)
+        await self.store_path_sig.set(self._store_path)
+        return provider
 
     async def _drain(self, datakey_name: str) -> None:
         capacity = self.writer.sources[datakey_name].capacity
@@ -59,7 +81,7 @@ class MMDataLogic(BaseDataLogic, Loggable):
         self._drain_ready_event.set()
         try:
             while True:
-                img = await self.queue.get()
+                img = await self.queue.async_get()
                 if await self.write_sig.get_value():
                     if not self.writer.is_open:
                         self.writer.open()
