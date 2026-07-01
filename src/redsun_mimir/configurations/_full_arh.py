@@ -44,8 +44,8 @@ def run_arh_container() -> None:
         # devices
         serial = declare_device(MMSerialDevice, from_config="serial")
         iscat = declare_device(MMHamamatsuCamera, from_config="camera")
-        # stage_xy = declare_device(MMASIXYStage, from_config="stage_xy")
-        # stage_z = declare_device(MMASIZStage, from_config="stage_z")
+        stage_xy = declare_device(MMASIXYStage, from_config="stage_xy")
+        stage_z = declare_device(MMASIZStage, from_config="stage_z")
         # laser = declare_device(UC2LaserDevice, from_config="laser")
 
         # presenters
