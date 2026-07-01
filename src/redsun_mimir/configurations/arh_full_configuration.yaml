@@ -6,10 +6,20 @@ devices:
   serial:
     port: COM3
     baudrate: 115200
+    device: COM3
+  serial25:
+    port: COM25
+    baudrate: 9600
+    device: COM25
   stage_xy: {}
   stage_z: {}
-  laser:
-    wavelength: 650
+  spectra:
+    port: serial25
+  fw_controller:
+    port: serial
+  filterwheel:
+    wheel_number: 0
+    num_positions: 8
   camera: {}
 
 
@@ -24,6 +34,8 @@ presenters:
     timeout: 2.0
   det_ctrl:
     timeout: 2.0
+  fw_ctrl:
+    timeout: 2.0
 
 
 views:
@@ -33,3 +45,4 @@ views:
   img_widget: {}
   det_widget: {}
   storage_widget: {}
+  fw_widget: {}

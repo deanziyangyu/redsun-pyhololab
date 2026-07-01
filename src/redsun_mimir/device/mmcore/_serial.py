@@ -78,10 +78,26 @@ class MMBaseSerialDevice(StandardReadable, Loggable):
 
 
 class MMSerialDevice(MMBaseSerialDevice):
-    """Alias for MMBaseSerialDevice for easier configuration-based instantiation."""
+    """Alias for MMBaseSerialDevice for easier configuration-based instantiation.
+
+    Parameters
+    ----------
+    name : str
+        MMCore device label.
+    port : str
+        COM port path (e.g. ``"COM3"``).
+    baudrate : int
+        Baud rate (default 115200).
+    device : str
+        MMCore device name for the adapter (default ``"COM3"``).
+        Should match the ``port`` argument.
+    """
 
     def __init__(self, name: str, **kwargs) -> None:
-        super().__init__(name, 
-                         adapter="SerialManager",
-                         device="COM3",
-                         **kwargs)
+        device = kwargs.pop("device", "COM3")
+        super().__init__(
+            name,
+            adapter="SerialManager",
+            device=device,
+            **kwargs,
+        )
