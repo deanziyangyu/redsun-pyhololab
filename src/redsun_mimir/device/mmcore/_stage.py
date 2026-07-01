@@ -8,7 +8,7 @@ from redsun.device import DeviceMap
 from redsun.log import Loggable
 
 from ._backend import mm_position_signal
-from ._common import MMAdapterInfo, MMSerialAdapterInfo
+from ._common import MMAdapterInfo
 
 if TYPE_CHECKING:
     from ophyd_async.core import SignalRW
@@ -32,21 +32,31 @@ class MMDemoXYStage(StandardReadable, Loggable):
         super().__init__(name)
 
 class MMASIXYStage(StandardReadable):
-    """ASI XY stage device."""
+    """ASI XY stage device.
+
+    Parameters
+    ----------
+    name : str
+        Name for this device.
+    units : str
+        Engineering units for the position signals (default ``"um"``).
+    port : str
+        MMCore label of the pre-loaded ``SerialManager`` device to use
+        for serial communication (default ``"serial"``).
+    """
 
     axis: DeviceMap[SignalRW[float]]
 
-    def __init__(self, name: str, *, units: str = "um") -> None:
-        adapter_info = MMSerialAdapterInfo(
+    def __init__(
+        self, name: str, *, units: str = "um", port: str = "serial"
+    ) -> None:
+        adapter_info = MMAdapterInfo(
             adapter="ASIStage",
             device="XYStage",
-            port="COM3",
-            baudrate=115200
         )
         self.core = Core.instance()
         self.core.loadDevice(name, adapter_info.adapter, adapter_info.device)
-        if adapter_info.port:
-            self.core.setProperty(name, "Port", adapter_info.port)
+        self.core.setProperty(name, "Port", port)
         self.core.initializeDevice(name)
         with self.add_children_as_readables():
             self.x = mm_position_signal(self.core, name, "x", units)
@@ -73,21 +83,31 @@ class MMDemoZStage(StandardReadable):
         super().__init__(name)
 
 class MMASIZStage(StandardReadable):
-    """ASI Z stage device."""
+    """ASI Z stage device.
+
+    Parameters
+    ----------
+    name : str
+        Name for this device.
+    units : str
+        Engineering units for the position signals (default ``"um"``).
+    port : str
+        MMCore label of the pre-loaded ``SerialManager`` device to use
+        for serial communication (default ``"serial"``).
+    """
 
     axis: DeviceMap[SignalRW[float]]
 
-    def __init__(self, name: str, *, units: str = "um") -> None:
-        adapter_info = MMSerialAdapterInfo(
+    def __init__(
+        self, name: str, *, units: str = "um", port: str = "serial"
+    ) -> None:
+        adapter_info = MMAdapterInfo(
             adapter="ASIStage",
             device="ZStage",
-            port="COM3",
-            baudrate=115200
         )
         self.core = Core.instance()
         self.core.loadDevice(name, adapter_info.adapter, adapter_info.device)
-        if adapter_info.port:
-            self.core.setProperty(name, "Port", adapter_info.port)
+        self.core.setProperty(name, "Port", port)
         self.core.initializeDevice(name)
         with self.add_children_as_readables():
             self.z = mm_position_signal(self.core, name, "z", units)

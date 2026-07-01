@@ -56,8 +56,6 @@ class MMBaseSerialDevice(StandardReadable, Loggable):
             port=port,
             baudrate=baudrate
         )
-        print()
-
         # Load and initialize the device in the Micro-Manager core
         self.core.loadDevice(name, adapter_info.adapter, adapter_info.device)
         try:
