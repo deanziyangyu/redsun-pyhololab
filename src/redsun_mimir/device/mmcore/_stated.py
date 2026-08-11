@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from ophyd_async.core import StandardReadable, StandardReadableFormat, soft_signal_rw
 from pymmcore_plus import CMMCorePlus as Core
 from redsun.log import Loggable
 
 from ._backend import mm_property_signal
 from ._common import MMAdapterInfo
-
-if TYPE_CHECKING:
-    from ophyd_async.core import SignalRW
 
 _FW_LABELS: dict[int, str] = {
     0: "610BP60",
@@ -98,10 +93,11 @@ class MMBaseStatedDevice(StandardReadable, Loggable):
 
     async def set_position(self, position: int) -> None:
         """Move the filter wheel to *position* (0-based index)."""
-        if not (0 <= position < self.num_positions.source):
+        num_positions = await self.num_positions.get_value()
+        if not (0 <= position < num_positions):
             raise ValueError(
                 f"Position {position} out of range "
-                f"(0–{self.num_positions.source - 1})"
+                f"(0–{num_positions - 1})"
             )
         await self.position.set(position)
         self.logger.info("Moved to position %d (%s)", position, self.label_for(position))
