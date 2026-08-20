@@ -30,9 +30,7 @@ requires-python = ">=3.11"
 dependencies = [
     "napari>=0.7.0",
     "msgspec>=0.21.1",
-    "redsun[zarr]>=0.10.0rc6",
-    "culsans>=0.11.0",
-    "aiologic>=0.16.0",
+    "redsun[zarr]>=0.11.0",
 ]
 
 [dependency-groups]
@@ -40,13 +38,14 @@ dev = [
     { include-group = "pyqt" },
     { include-group = "sim" },
     { include-group = "uc2" },
-    "mypy>=1.20",
-    "pre-commit>=4.3.0",
-    "pytest>=8.4.2",
-    "pytest-asyncio>=0.25.0",
+    "mypy>=2.3.0",
+    "pre-commit>=4.5.0",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
+    "pytest-env>=1.1.5",
     "pytest-qt>=4.5.0",
-    "ruff>=0.14.2",
+    "ruff>=0.16.0",
 ]
 uc2 = [
     "pymmcore-plus>=0.18.1",
@@ -110,11 +109,11 @@ exclude_lines = [
 ]
 omit = [
     "src/redsun_mimir/__main__.py",
-    "src/redsun_mimir/configurations/**",
 ]
 
 [tool.mypy]
-files = "src/**/*.py"
+# tests are type-checked too, same as redsun
+files = ["src", "tests"]
 disable_error_code = [
     "import-untyped",
     "import-not-found",
@@ -135,6 +134,12 @@ testpaths = [
     "tests"
 ]
 pythonpath = ["."]
+markers = [
+    "qt: tests that need a Qt application (auto-skipped headless)",
+]
+
+[tool.pytest_env]
+QT_QPA_PLATFORM = "offscreen"
 
 [tool.ruff]
 fix = true
@@ -179,6 +184,3 @@ include = ["src"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/redsun_mimir"]
-
-[tool.uv]
-prerelease = "if-necessary-or-explicit"

@@ -1,34 +1,39 @@
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
-from dependency_injector import providers
 from redsun.aio import run_coro
 from redsun.device.protocols import HasAsyncShutdown
 from redsun.log import Loggable
 from redsun.presenter import Presenter
-from redsun.utils import find_signals
-from redsun.virtual import Signal
+from redsun.virtual import slot
 
-from redsun_mimir.protocols import MotorProtocol  # noqa: TC001
+from redsun_mimir.protocols import MotorProtocol
+from redsun_mimir.providers import MOTOR_DESCRIPTION, MOTOR_READBACKS, MOTOR_READINGS
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from typing import Any
 
     from bluesky.protocols import Descriptor, Reading
-    from ophyd_async.core import Device
+    from ophyd_async.core import Device, SignalR
     from redsun.virtual import VirtualContainer
 
 
 class MotorPresenter(Presenter, Loggable):
     """Presenter for motor stage control.
 
-    Allows manual stage positioning by forwarding movement requests from
-    [`MotorView`][redsun_mimir.view.MotorView] to the individual axis
-    objects.  Each move is dispatched to the shared bluesky event loop via
-    [`asyncio.run_coroutine_threadsafe`][asyncio.run_coroutine_threadsafe]
-    so the Qt main thread is never blocked.
+    Allows manual stage positioning by forwarding movement requests to the
+    individual axis objects. `move` is a coroutine connected directly to the
+    requesting signal, so the emitting thread never waits for the device.
+
+    Moves are serialised per device: a stage that writes several coordinates on
+    every set cannot have two of them in flight at once.
+
+    Positions are not announced: the axis readbacks are published as
+    [`MOTOR_READBACKS`][redsun_mimir.providers.MOTOR_READBACKS] and whoever
+    displays them subscribes to those instead.
 
     Axes are discovered at initialisation by iterating over each device's
     [`children()`][ophyd_async.core.Device.children] and retaining those that
@@ -42,16 +47,7 @@ class MotorPresenter(Presenter, Loggable):
         Mapping of device names to device instances.
     timeout :
         Timeout for motor operations in seconds. Defaults to ``2.0``.
-
-    Attributes
-    ----------
-    sigNewPosition :
-        Emitted when a move completes successfully.
-        Carries motor name (``str``), axis name (``str``), and new position
-        (``float``).
     """
-
-    sigNewPosition = Signal(str, str, float)
 
     def __init__(
         self,
@@ -68,6 +64,7 @@ class MotorPresenter(Presenter, Loggable):
             for name, device in devices.items()
             if isinstance(device, MotorProtocol)
         }
+        self._locks = {name: asyncio.Lock() for name in self._motors}
 
         self.logger.info("Initialized")
 
@@ -85,14 +82,33 @@ class MotorPresenter(Presenter, Loggable):
             result.update(run_coro(device.describe()))
         return result
 
-    def move(self, motor: str, axis: str, position: float) -> None:
-        """Dispatch an async move of *axis* on *motor* to *position*."""
-        run_coro(self.move_async(motor, axis, position))
+    def devices_readbacks(self) -> dict[str, SignalR[float]]:
+        """Get the readback signal of every motor axis, by data key."""
+        return {
+            movable.name: movable.movable_logic.readback
+            for device in self._motors.values()
+            for movable in device.axis.values()
+        }
 
-    async def move_async(self, motor: str, axis: str, position: float) -> None:
-        """Move an axis and emit the new position on completion."""
-        await self._motors[motor].axis[axis].set(position)
-        self.sigNewPosition.emit(motor, axis, position)
+    @slot
+    async def move(self, motor: str, axis: str, delta: float) -> None:
+        """Move *axis* by *delta*.
+
+        Parameters
+        ----------
+        motor : str
+            Device name.
+        axis : str
+            Axis name within that device.
+        delta : float
+            Displacement from the current position, in the axis' units.
+        """
+        # one lock per device, not per axis: a Micro-Manager XY stage writes
+        # both coordinates on every set, so a concurrent move on the sibling
+        # axis would carry a stale value for this one and revert it
+        async with self._locks[motor]:
+            movable = self._motors[motor].axis[axis]
+            await movable.set((await movable.locate())["readback"] + delta)
 
     def shutdown(self) -> None:
         """Shutdown all motor devices."""
@@ -102,12 +118,7 @@ class MotorPresenter(Presenter, Loggable):
 
     def register_providers(self, container: VirtualContainer) -> None:
         """Register motor model info as a provider in the DI container."""
-        container.motor_readings = providers.Object(self.devices_readings())
-        container.motor_description = providers.Object(self.devices_description())
+        container.provide(MOTOR_READINGS, self.devices_readings())
+        container.provide(MOTOR_DESCRIPTION, self.devices_description())
+        container.provide(MOTOR_READBACKS, self.devices_readbacks())
         container.register_signals(self)
-
-    def inject_dependencies(self, container: VirtualContainer) -> None:
-        """Connect to the virtual container signals."""
-        sigs = find_signals(container, ["sigMotorMove", "sigConfigChanged"])
-        if "sigMotorMove" in sigs:
-            sigs["sigMotorMove"].connect(self.move)

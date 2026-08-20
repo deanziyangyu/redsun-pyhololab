@@ -1,22 +1,17 @@
 devices:
-  # mimir devices
-  mimir-serial: redsun_mimir.device.youseetoo:MimirSerialDevice
-  mimir-motor: redsun_mimir.device.youseetoo:MimirMotorDevice
-  mimir-laser: redsun_mimir.device.youseetoo:MimirLaserDevice
+  # youseetoo (UC2) devices
+  uc2-serial: redsun_mimir.device.youseetoo:UC2Serial
+  uc2-motor: redsun_mimir.device.youseetoo:UC2MotorDevice
+  uc2-laser: redsun_mimir.device.youseetoo:UC2LaserDevice
 
   # mmcore devices
-  mmcore-camera: redsun_mimir.device.mmcore:MMCoreCameraDevice
-  mmcore-filterwheel: redsun_mimir.device.mmcore:MMASIFilterWheel
-  mmcore-fw-controller: redsun_mimir.device.mmcore:MMASIFWController
-  mmcore-spectra: redsun_mimir.device.mmcore:MMSpectraShutteredDevice
-  mmcore-stage: redsun_mimir.device.mmcore:MMCoreStageDevice
+  mmcore-demo-camera: redsun_mimir.device.mmcore:MMDemoCamera
+  mmcore-daheng-camera: redsun_mimir.device.mmcore:MMDahengCamera
+  mmcore-demo-xy-stage: redsun_mimir.device.mmcore:MMDemoXYStage
+  mmcore-demo-z-stage: redsun_mimir.device.mmcore:MMDemoZStage
 
   # mock devices
   mock-light: redsun_mimir.device:MockLightDevice
-  mock-mmcore-serial: redsun_mimir.device.mmcore:MockMMSerialDevice
-  mock-mmcore-filterwheel: redsun_mimir.device.mmcore:MockMMASIFilterWheel
-  mock-mmcore-fw-controller: redsun_mimir.device.mmcore:MockMMASIFWController
-  mock-mmcore-spectra: redsun_mimir.device.mmcore:MockMMSpectraShutteredDevice
 
 presenters:
   acquisition: redsun_mimir.presenter.acquisition:AcquisitionPresenter
@@ -24,7 +19,6 @@ presenters:
   light: redsun_mimir.presenter.light:LightPresenter
   detector: redsun_mimir.presenter.detector:DetectorPresenter
   median: redsun_mimir.presenter.median:MedianPresenter
-  storage: redsun_mimir.presenter.storage:FileStoragePresenter
   filterwheel: redsun_mimir.presenter.filterwheel:FilterWheelPresenter
 
 views:
@@ -33,5 +27,4 @@ views:
   detector: redsun_mimir.view.detector:DetectorView
   motor: redsun_mimir.view.motor:MotorView
   light: redsun_mimir.view.light:LightView
-  storage: redsun_mimir.view.storage:FileStorageView
   filterwheel: redsun_mimir.view.filterwheel:FilterWheelView

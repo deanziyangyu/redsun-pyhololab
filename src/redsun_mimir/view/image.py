@@ -15,6 +15,9 @@ from qtpy import QtCore, QtGui, QtWidgets
 from redsun.log import Loggable
 from redsun.view import ViewPosition
 from redsun.view.qt import QtView
+from redsun.virtual import slot
+
+from redsun_mimir.providers import DETECTOR_LAYER_SPECS
 
 if TYPE_CHECKING:
     from typing import Any
@@ -53,6 +56,7 @@ class ImageView(QtView, Loggable):
     def __init__(
         self,
         name: str,
+        /,
     ) -> None:
         super().__init__(name)
 
@@ -149,14 +153,8 @@ class ImageView(QtView, Loggable):
         container.register_signals(self)
 
     def inject_dependencies(self, container: VirtualContainer) -> None:
-        """Inject detector configuration and create image layers."""
-        specs: dict[str, LayerSpec] = container.detector_layer_specs()
-        self.setup_layers(specs)
-        for cache in container.signals.values():
-            if "sigNewData" in cache:
-                cache["sigNewData"].connect(self._update_layers, thread="main")
-            if "sigNewMedian" in cache:
-                cache["sigNewMedian"].connect(self._update_layers, thread="main")
+        """Create one image layer per detector."""
+        self.setup_layers(container.require(DETECTOR_LAYER_SPECS))
 
     def setup_layers(self, specs: dict[str, LayerSpec]) -> None:
         """Create an empty image layer for each detector based on the provided specifications."""
@@ -165,7 +163,8 @@ class ImageView(QtView, Loggable):
             buffer = np.zeros(spec["shape"], dtype=np.dtype(spec["dtype"]))
             self.viewer_model.add_image(buffer, name=name)
 
-    def _update_layers(self, data: dict[str, Reading[Any]]) -> None:
+    @slot
+    def update_layers(self, data: dict[str, Reading[Any]]) -> None:
         """Push incoming frame data into the corresponding image layers.
 
         Parameters

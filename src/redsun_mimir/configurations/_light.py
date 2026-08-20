@@ -6,14 +6,13 @@ from pathlib import Path
 from redsun.containers import declare_device, declare_presenter, declare_view
 from redsun.qt import QtAppContainer
 
+from ._wiring import wire_light
+
 _CONFIG = Path(__file__).parent / "light_configuration.yaml"
 
 
-def run_light_container() -> None:
-    """Run a local mock light example.
-
-    Launches a Qt ``LightView`` app with a mock light device.
-    """
+def build_light_container() -> QtAppContainer:
+    """Return the example container, unbuilt (see `build_acquisition_container`)."""
     from redsun_mimir.device import MockLightDevice
     from redsun_mimir.presenter.light import LightPresenter
     from redsun_mimir.view.light import LightView
@@ -26,4 +25,15 @@ def run_light_container() -> None:
         ctrl = declare_presenter(LightPresenter, from_config="light_ctrl")
         widget = declare_view(LightView, from_config="widget")
 
-    LightApp().run()
+        def wire(self) -> None:
+            wire_light(self, self.ctrl, self.widget)
+
+    return LightApp()
+
+
+def run_light_container() -> None:
+    """Run a local mock light example.
+
+    Launches a Qt ``LightView`` app with a mock light device.
+    """
+    build_light_container().run()

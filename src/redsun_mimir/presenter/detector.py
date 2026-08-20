@@ -2,30 +2,51 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
 from bluesky.protocols import Descriptor  # noqa: TC002
-from dependency_injector import providers
+from event_model import DocumentRouter
 from redsun.aio import run_coro
 from redsun.log import Loggable
 from redsun.presenter import Presenter
-from redsun.utils import find_signals
-from redsun.virtual import Signal
+from redsun.virtual import Signal, slot
 
-from redsun_mimir.protocols import DetectorProtocol  # noqa: TC001
+from redsun_mimir.protocols import DetectorProtocol
+from redsun_mimir.providers import (
+    DETECTOR_DESCRIPTORS,
+    DETECTOR_LAYER_SPECS,
+    DETECTOR_READINGS,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Mapping
 
-    import numpy.typing as npt
     from bluesky.protocols import Reading
+    from event_model.documents import Event, EventDescriptor
     from ophyd_async.core import Device, SignalRW
     from redsun.virtual import VirtualContainer
 
     from redsun_mimir.protocols import LayerSpec
 
 
-class DetectorPresenter(Presenter, Loggable):
+#: Configuration properties a view may change, each named after the signal
+#: that carries it on a detector. A whitelist, so a stray port name cannot
+#: reach an arbitrary attribute.
+_CONFIGURABLE = frozenset({"roi", "exposure", "pixel_dtype"})
+
+
+class DetectorPresenter(Presenter, DocumentRouter, Loggable):
     """Presenter for detector configuration and live data routing.
+
+    Live frames reach this presenter as Event documents - the plan puts each
+    detector's buffer signal under ``bps.monitor`` - rather than through a
+    direct ``subscribe_reading`` on the signal. Going through the document
+    sequence keeps every displayed frame part of the run: it is ordered
+    against the other documents, and any callback that reasons about the run
+    sees it.
+
+    Frames are forwarded **raw**. Background-median correction is
+    [`MedianPresenter`][redsun_mimir.presenter.MedianPresenter]'s
+    responsibility, and it publishes the corrected frames on its own signal
+    so raw and filtered end up as separate viewer layers.
 
     Parameters
     ----------
@@ -36,23 +57,19 @@ class DetectorPresenter(Presenter, Loggable):
     timeout : float | None, keyword-only, optional
         Timeout in seconds for async configuration calls.
         Defaults to ``1.0``.
-    hints : list[str] | None, keyword-only, optional
-        List of data key suffixes to look for in event documents
-        when routing data to the view.
-        Defaults to ``["buffer", "roi"]``.
 
     Attributes
     ----------
-    sigNewConfiguration : Signal[str, str, object]
+    sig_new_configuration : Signal[str, str, object]
         Emitted after a detector setting is successfully applied.
-        Carries the detector name (``str``) and a mapping of the
-        changed setting to its new value (``dict[str, object]``).
-    sigNewData : Signal[dict[str, Reading[Any]]]
-        Emitted when a new reading is available from a detector.
+        Carries the detector name (``str``), the canonical key of the
+        changed setting (``str``) and its new value (``object``).
+    sig_new_data : Signal[dict[str, Reading[Any]]]
+        Emitted for every live frame carried by an Event document.
     """
 
-    sigNewConfiguration = Signal(str, str, object)
-    sigNewData = Signal(object)
+    sig_new_configuration = Signal(str, str, object)
+    sig_new_data = Signal(object)
 
     def __init__(
         self,
@@ -68,82 +85,42 @@ class DetectorPresenter(Presenter, Loggable):
             for name, device in devices.items()
             if isinstance(device, DetectorProtocol)
         }
-        self._medians: dict[str, npt.NDArray[Any] | None] = {
-            name: None for name in self.detectors
+        #: buffer data keys this presenter forwards, by descriptor uid
+        self._live_streams: dict[str, list[str]] = {}
+        self._buffer_keys = {
+            detector.buffer.name for detector in self.detectors.values()
         }
 
-        # the internals of a signal backend are invoked in
-        # a running event loop; we need to dispatch the
-        # subscription coroutine to the background thread
-        async def subscribe_to_buffers() -> None:
-            for detector in self.detectors.values():
-                detector.buffer.subscribe_reading(
-                    self._make_buffer_callback(detector.name)
-                )
+    def descriptor(self, doc: EventDescriptor) -> None:
+        """Remember which streams carry a tracked detector's buffer."""
+        keys = [key for key in doc["data_keys"] if key in self._buffer_keys]
+        if keys:
+            self._live_streams[doc["uid"]] = keys
 
-        run_coro(subscribe_to_buffers())
-
-    def _make_buffer_callback(
-        self, det_name: str
-    ) -> Callable[[dict[str, Reading[Any]]], None]:
-        def _on_reading(reading: dict[str, Reading[Any]]) -> None:
-            corrected: dict[str, Reading[Any]] = {}
-            for key, r in reading.items():
-                frame = np.asarray(r["value"])
-                median = self._medians.get(det_name)
-                if median is not None and median.shape == frame.shape and median.any():
-                    frame = np.divide(
-                        frame,
-                        median,
-                        out=np.ones_like(frame, dtype=np.float32),
-                        where=median != 0,
-                    )
-                corrected[key] = {**r, "value": frame}
-            self.sigNewData.emit(corrected)
-
-        return _on_reading
-
-    def _update_median(self, data: dict[str, Reading[Any]]) -> None:
-        """Store the latest median frame per detector when MedianPresenter emits."""
-        for key, reading in data.items():
-            # signal name may be "" if named before device init,
-            # fall back to matching by detector name presence in key
-            for det_name in self._medians:
-                if det_name in key:
-                    self._medians[det_name] = np.asarray(reading["value"])
-                    self.logger.debug(
-                        f"Median updated for '{det_name}': "
-                        f"shape={self._medians[det_name].shape}"  # type: ignore
-                    )
-                    break
+    def event(self, doc: Event) -> Event:
+        """Forward the raw frames of a live event to the viewer."""
+        keys = self._live_streams.get(doc["descriptor"])
+        if keys is None:
+            return doc
+        readings: dict[str, Reading[Any]] = {
+            key: {"value": doc["data"][key], "timestamp": doc["time"]}
+            for key in keys
+            if key in doc["data"]
+        }
+        if readings:
+            self.sig_new_data.emit(readings)
+        return doc
 
     def register_providers(self, container: VirtualContainer) -> None:
         """Register detector info as providers in the DI container.
 
         Also registers detector signals in the container.
         """
-        container.detector_descriptors = providers.Object(self.devices_description())
-        container.detector_readings = providers.Object(self.devices_configuration())
-        container.detector_layer_specs = providers.Object(self.layer_specs())
+        container.provide(DETECTOR_DESCRIPTORS, self.devices_description())
+        container.provide(DETECTOR_READINGS, self.devices_configuration())
+        container.provide(DETECTOR_LAYER_SPECS, self.layer_specs())
         container.register_signals(self)
-
-    def inject_dependencies(self, container: VirtualContainer) -> None:
-        """Connect to the virtual container signals."""
-        sigs = find_signals(container, ["sigPropertyChanged"])
-        if "sigPropertyChanged" in sigs:
-            sigs["sigPropertyChanged"].connect(self.configure)
-        median_sigs = find_signals(container, ["sigNewMedian"])
-        if "sigNewMedian" in median_sigs:
-            median_sigs["sigNewMedian"].connect(self._update_median)
-        pre_launch_sigs = find_signals(container, ["sigPreLaunchNotify"])
-        if "sigPreLaunchNotify" in pre_launch_sigs:
-            pre_launch_sigs["sigPreLaunchNotify"].connect(self._clear_medians)
-
-    def _clear_medians(self, plan_name: str) -> None:
-        """Clear the stored median frames when a new plan starts."""
-        for det_name in self._medians:
-            self._medians[det_name] = None
-        self.logger.debug("Median frames cleared for new plan: %s", plan_name)
+        container.register_callbacks(self)
 
     def layer_specs(self) -> dict[str, LayerSpec]:
         """Get the layer specifications for all detector devices."""
@@ -168,8 +145,9 @@ class DetectorPresenter(Presenter, Loggable):
             result.update(run_coro(device.describe_configuration()))
         return result
 
-    def configure(self, detector: str, property: str, value: Any) -> None:
-        """Configure a detector property based on a user request from the view.
+    @slot
+    async def set(self, detector: str, property: str, value: Any) -> None:
+        """Set a detector configuration property and announce the new value.
 
         Parameters
         ----------
@@ -180,39 +158,17 @@ class DetectorPresenter(Presenter, Loggable):
         value : object
             New value for the setting.
         """
-        match property:
-            case "roi":
-                roi = self.detectors[detector].roi
-                run_coro(self._set(detector, roi, value))
-            case "exposure":
-                exposure = self.detectors[detector].exposure
-                run_coro(self._set(detector, exposure, value))
-            case "pixel_dtype":
-                pixel_dtype = self.detectors[detector].pixel_dtype
-                run_coro(self._set(detector, pixel_dtype, value))
-            case _:
-                self.logger.error(
-                    f"Unknown property {property!r} for detector {detector!r}"
-                )
+        if property not in _CONFIGURABLE:
+            self.logger.error(f"Unknown property {property!r} for {detector!r}")
+            return
 
-    def emit_new_data(self, data: dict[str, Reading[Any]]) -> None:
-        """Emit new data readings from a detector.
-
-        Strip the "buffer" suffix from the data key before emitting.
-        """
-        key = next(iter(data.keys()))
-        if key.endswith("buffer"):
-            new_key = key[: -len("buffer")]
-            data[new_key] = data.pop(key)
-        self.sigNewData.emit(data)
-
-    async def _set(self, det_name: str, obj: SignalRW[Any], value: Any) -> None:
-        """Set *obj* to *value* asynchronously."""
+        obj: SignalRW[Any] = getattr(self.detectors[detector], property)
         status = obj.set(value)
         await status
         if not status.success:
             self.logger.error(f"Failed to set {obj} to {value!r}: {status.exception()}")
-        else:
-            new_reading = await obj.read()
-            value = new_reading[obj.name]["value"]
-            self.sigNewConfiguration.emit(det_name, obj.name, value)
+            return
+        new_reading = await obj.read()
+        self.sig_new_configuration.emit(
+            detector, obj.name, new_reading[obj.name]["value"]
+        )

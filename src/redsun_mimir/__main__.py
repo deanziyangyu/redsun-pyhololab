@@ -1,6 +1,6 @@
 from argparse import ArgumentParser, Namespace
 
-import redsun_mimir.configurations as configurations
+from redsun_mimir import configurations
 
 
 class Options(Namespace):
@@ -27,11 +27,6 @@ def main() -> None:
         "acquisition",
         help="Run the example acquisition container",
     )
-    subparsers.add_parser(
-        "arh",
-        help="Run the arh acquisition container",
-    )
-
     options = parser.parse_args(namespace=Options())
     if options.command == "sim":
         configurations.run_simulation_container()
@@ -45,8 +40,6 @@ def main() -> None:
         configurations.run_mmcore_mock_container()
     elif options.command == "acquisition":
         configurations.run_acquisition_container()
-    elif options.command == "arh":
-        configurations.run_arh_container()
     else:
         parser.print_help()
 

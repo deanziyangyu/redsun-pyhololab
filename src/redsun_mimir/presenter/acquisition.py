@@ -6,10 +6,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import bluesky.plan_stubs as bps
-import numpy as np
 import redsun.engine.plan_stubs as rps
-from bluesky.utils import MsgGenerator, RequestAbort  # noqa: TC002
-from dependency_injector import providers
+from bluesky.preprocessors import set_run_key_wrapper
+from bluesky.utils import MsgGenerator, RequestAbort
 from ophyd_async.core import TriggerInfo
 from redsun.engine import RunEngine
 from redsun.engine.actions import Action, continous
@@ -22,25 +21,27 @@ from redsun.presenter.plan_spec import (
     create_plan_spec,
     resolve_arguments,
 )
-from redsun.utils import find_signals
-from redsun.virtual import Signal
+from redsun.virtual import Signal, slot
 
 from redsun_mimir.protocols import (  # noqa: TC001
-    MedianFlyer,
     MotorProtocol,
     ReadableFlyer,
 )
+from redsun_mimir.providers import PLAN_SPECS
+from redsun_mimir.streams import LIVE_VIEW_STREAM, MEDIAN_SCAN_STREAM
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
     from concurrent.futures import Future
-    from typing import Any, Callable, Mapping
+    from typing import Any
 
-    import numpy.typing as npt
     from ophyd_async.core import Device
     from redsun.engine.actions import SRLatch
     from redsun.virtual import VirtualContainer
 
-    from redsun_mimir.device.median import MedianDevice
+#: Run key isolating the background scan from the enclosing live run, so the
+#: median presenter sees a start/descriptor/event/stop cycle of its own.
+_MEDIAN_RUN_KEY = "median_scan"
 
 
 @dataclass
@@ -75,15 +76,19 @@ class StreamAction(Action):
     toggle_states: tuple[str, str] = ("start", "stop")
 
 
-def prepare_and_kickoff(
-    detectors: Sequence[ReadableFlyer | MedianDevice],
+def prepare_and_declare(
+    detectors: Sequence[ReadableFlyer],
     trigger_info: TriggerInfo,
     stream_name: str,
     *,
     collect: bool = True,
     declare: bool = True,
 ) -> MsgGenerator[None]:
-    """Prepare, optionally declare stream, and kickoff detectors.
+    """Prepare detectors and optionally declare their stream.
+
+    Preparing starts live acquisition and hands each detector the sink it
+    *will* write through; the write window itself only opens at kickoff, so
+    frames reach viewers but not storage until then.
 
     Staging is the caller's responsibility so that multiple device
     groups can be staged together in one ``stage_all`` call.
@@ -92,20 +97,10 @@ def prepare_and_kickoff(
         yield from bps.prepare(det, trigger_info, wait=True)
     if declare:
         yield from bps.declare_stream(*detectors, name=stream_name, collect=collect)
-    yield from bps.kickoff_all(*detectors, wait=True)
-
-
-def set_writing(
-    detectors: Sequence[ReadableFlyer | MedianDevice],
-    enabled: bool,
-) -> MsgGenerator[None]:
-    """Set ``write_sig`` on all detectors to *enabled*."""
-    for det in detectors:
-        yield from bps.abs_set(det.write_sig, enabled, wait=True)
 
 
 def teardown_acquisition(
-    detectors: Sequence[ReadableFlyer | MedianDevice],
+    detectors: Sequence[ReadableFlyer],
     stream_name: str,
 ) -> MsgGenerator[None]:
     """Complete, collect, and unstage detectors."""
@@ -119,31 +114,35 @@ class AcquisitionPresenter(Presenter, Loggable):
 
     Parameters
     ----------
-    devices: Mapping[str, Device]
+    name : str
+        Identity key of the presenter.
+    devices : Mapping[str, Device]
         The available devices in the application.
-        The virtual bus to register signals on.
-    callbacks: list[str] | None, keyword-only, optional
-        Callback names to subscribe to on the run engine, if any.
-        If not provided, no callbacks will be subscribed to.
-        Defaults to None.
+    callbacks : list[str] | None, optional
+        Names of the document callbacks to subscribe on the run engine.
+        Defaults to ``None``, meaning **every** callback registered on the
+        virtual container is subscribed - live visualization and median
+        filtering are document-driven, so an unlisted callback is a silently
+        dead viewer. Pass an explicit list to restrict the selection, or an
+        empty list to subscribe none.
 
     Attributes
     ----------
-    sigPreLaunchNotify : Signal[str]
+    sig_pre_launch_notify : Signal[str]
         Emitted before launching a plan,
         carrying the name of the plan to be launched as a `str`.
         Useful to notify other presenters to prepare
-        for the upcoming plan launch (e.g., to set up writers).
-    sigPlanDone : Signal[None]
+        for the upcoming plan launch (e.g., to set up storage paths).
+    sig_plan_done : Signal[None]
         Emitted when a non-togglable plan completes.
-    sigActionDone : Signal[str]
+    sig_action_done : Signal[str]
         Emitted when an action event is cleared.
         Carries the name of the action as a `str`.
     """
 
-    sigPreLaunchNotify = Signal(str)
-    sigPlanDone = Signal()
-    sigActionDone = Signal(str)
+    sig_pre_launch_notify = Signal(str)
+    sig_plan_done = Signal()
+    sig_action_done = Signal(str)
 
     def __init__(
         self,
@@ -159,7 +158,10 @@ class AcquisitionPresenter(Presenter, Loggable):
         self.futures: set[Future[Any]] = set()
         self.action_map: dict[str, SRLatch] = {}
         self.discard_by_pause = False
-        self.expected_callbacks = frozenset(callbacks or [])
+        # None => subscribe whatever the container registered
+        self.expected_callbacks: frozenset[str] | None = (
+            None if callbacks is None else frozenset(callbacks)
+        )
         self.callback_tokens: dict[str, int] = {}
 
         self.plans: dict[str, Callable[..., MsgGenerator[Any]]] = {
@@ -167,10 +169,10 @@ class AcquisitionPresenter(Presenter, Loggable):
             "live_median_scan": self.live_median_scan,
         }
         self.plan_specs: dict[str, PlanSpec] = {}
-        for name, plan in self.plans.items():
+        for plan_name, plan in self.plans.items():
             spec = self._try_build_plan_spec(plan, devices)
             if spec is not None:
-                self.plan_specs[name] = spec
+                self.plan_specs[plan_name] = spec
         self._is_single_shot_plan = False
 
     def _try_build_plan_spec(
@@ -187,38 +189,26 @@ class AcquisitionPresenter(Presenter, Loggable):
 
     def register_providers(self, container: VirtualContainer) -> None:
         """Register plan specs as a provider in the DI container."""
-        container.plan_specs = providers.Object(self.plans_specificiers())
+        container.provide(PLAN_SPECS, self.plans_specificiers())
         container.register_signals(self)
 
     def inject_dependencies(self, container: VirtualContainer) -> None:
-        """Connect to the virtual container signals."""
-        self._container = container
-
-        sigs = find_signals(
-            container,
-            [
-                "sigLaunchPlanRequest",
-                "sigStopPlanRequest",
-                "sigPauseResumeRequest",
-                "sigActionRequest",
-            ],
-        )
-        if "sigLaunchPlanRequest" in sigs:
-            sigs["sigLaunchPlanRequest"].connect(self.launch_plan)
-        if "sigStopPlanRequest" in sigs:
-            sigs["sigStopPlanRequest"].connect(self.stop_plan)
-        if "sigPauseResumeRequest" in sigs:
-            sigs["sigPauseResumeRequest"].connect(self.pause_or_resume_plan)
-        if "sigActionRequest" in sigs:
-            sigs["sigActionRequest"].connect(self.toggle_action_event)
-
-        if len(self.expected_callbacks) > 0:
-            msg = ", ".join(self.expected_callbacks)
-            self.logger.debug(f"Registering callbacks: {msg}")
-            for name, callback in container.callbacks.items():
-                if name in self.expected_callbacks:
-                    token = self.engine.subscribe(callback)
-                    self.callback_tokens[name] = token
+        """Subscribe the engine to the document callbacks the session offers."""
+        for name, callback in container.callbacks.items():
+            if self.expected_callbacks is not None and name not in (
+                self.expected_callbacks
+            ):
+                continue
+            self.callback_tokens[name] = self.engine.subscribe(callback)
+        if self.callback_tokens:
+            self.logger.debug(
+                f"Subscribed callbacks: {', '.join(self.callback_tokens)}"
+            )
+        else:
+            self.logger.warning(
+                "No document callbacks subscribed: live visualization and "
+                "median filtering will produce nothing."
+            )
 
     def plans_specificiers(self) -> set[PlanSpec]:
         """Return the current set of plan specifications for the available plans."""
@@ -227,14 +217,16 @@ class AcquisitionPresenter(Presenter, Loggable):
     @continous
     def live_median_scan(
         self,
-        detectors: Sequence[MedianFlyer],
+        detectors: Sequence[ReadableFlyer],
         motor: MotorProtocol,
         step: float = 5.0,
         scan_frames: int = 40,
         stream_frames: int = 10,
         /,
-        scan_action: Action = ScanAction(),
-        stream_action: Action = StreamAction(togglable=False),
+        # the defaults ARE the plan's UI contract: create_plan_spec
+        # introspects them to build the parameter widgets
+        scan_action: Action = ScanAction(),  # noqa: B008
+        stream_action: Action = StreamAction(togglable=False),  # noqa: B008
     ) -> MsgGenerator[None]:
         """Perform live data collection with temporal median filtering.
 
@@ -279,23 +271,22 @@ class AcquisitionPresenter(Presenter, Loggable):
         self.action_map.update(**scan_action.event_map, **stream_action.event_map)
 
         live_stream = "live_stream"
-        median_stream = "median_stream"
         stream_prepare_info = TriggerInfo(number_of_events=stream_frames)
-        median_info = TriggerInfo(number_of_events=1)
-
-        median_detectors = [det.median for det in detectors]
 
         live_stream_declared = False
-        median_stream_declared = False
-        medians_ready = False
         restage = True
 
         yield from bps.open_run()
 
+        # every live frame travels as an Event document so MedianPresenter
+        # can divide it by the background median and publish the result
+        for det in detectors:
+            yield from bps.monitor(det.buffer, name=LIVE_VIEW_STREAM)
+
         while True:
             if restage:
                 yield from bps.stage_all(*detectors)
-                yield from prepare_and_kickoff(
+                yield from prepare_and_declare(
                     detectors,
                     stream_prepare_info,
                     live_stream,
@@ -310,38 +301,11 @@ class AcquisitionPresenter(Presenter, Loggable):
 
             if name == scan_action.name:
                 yield from self.square_scan(detectors, motor, step, scan_frames // 4)
-                medians_ready = True
 
             elif name == stream_action.name:
                 self.logger.debug("Start writing")
-
-                yield from set_writing(detectors, True)
-                if medians_ready:
-                    yield from bps.stage_all(*median_detectors)
-                    yield from set_writing(median_detectors, True)
-                    yield from prepare_and_kickoff(
-                        median_detectors,
-                        median_info,
-                        median_stream,
-                        declare=not median_stream_declared,
-                        collect=True,
-                    )
-                    median_stream_declared = True
-
-                yield from bps.complete_all(*detectors, wait=True)
-                if medians_ready:
-                    yield from bps.complete_all(*median_detectors, wait=True)
-
-                if medians_ready:
-                    yield from bps.collect(*median_detectors, name=median_stream)
-                yield from bps.collect(*detectors, name=live_stream)
-
-                if medians_ready:
-                    yield from bps.unstage_all(*median_detectors)
-                    yield from set_writing(median_detectors, False)
-
-                yield from bps.unstage_all(*detectors)
-                yield from set_writing(detectors, False)
+                yield from bps.kickoff_all(*detectors, wait=True)
+                yield from teardown_acquisition(detectors, live_stream)
                 restage = True
                 self.logger.debug("Writing complete")
 
@@ -349,25 +313,24 @@ class AcquisitionPresenter(Presenter, Loggable):
 
     def square_scan(
         self,
-        detectors: Sequence[MedianFlyer],
+        detectors: Sequence[ReadableFlyer],
         motor: MotorProtocol,
         step: float,
         frames_per_side: int,
     ) -> MsgGenerator[None]:
-        """Perform a square scan movement with the specified motor and detectors.
+        """Collect a background stack by moving the motor in a square.
 
-        Performs a square scan by moving the motor in a square pattern; before
-        each movement step, a reading is taken from the specified detectors.
+        The stack is emitted as Event documents in a **nested run**, which
+        gives [`MedianPresenter`][redsun_mimir.presenter.MedianPresenter] a
+        natural boundary: it accumulates the frames and computes - and
+        writes - the median when that run stops.
 
-        Scan sequence is: x -> y -> -x -> -y,
-        with the number of frames collected for each side determined
-        by the *frames_per_side* parameter.
+        Scan sequence is x -> y -> -x -> -y, with *frames_per_side* frames
+        collected along each side.
 
         Parameters
         ----------
-        stream : str
-            Document stream to emit documents on.
-        detectors : Sequence[MedianFlyer]
+        detectors : Sequence[ReadableFlyer]
             The detectors to read from before each motor movement.
         motor : MotorProtocol
             The motor to use for the scan movement.
@@ -375,47 +338,36 @@ class AcquisitionPresenter(Presenter, Loggable):
             The step size for motor movement.
         frames_per_side : int
             The number of frames to collect for each side of the square.
-
-        Returns
-        -------
-        bool
-            Always returns True to indicate the median frames are ready.
         """
+        yield from set_run_key_wrapper(
+            self._square_scan_run(detectors, motor, step, frames_per_side),
+            _MEDIAN_RUN_KEY,
+        )
+
+    def _square_scan_run(
+        self,
+        detectors: Sequence[ReadableFlyer],
+        motor: MotorProtocol,
+        step: float,
+        frames_per_side: int,
+    ) -> MsgGenerator[None]:
+        """Emit the square-scan stack as its own run."""
         # TODO: handle the case of failure in motor movement or detector gracefully;
-        # probably best to wrap any exception in try-except and return false.
+        # probably best to wrap any exception in try-except.
         x = motor.axis["x"]
         y = motor.axis["y"]
 
-        frames: dict[str, list[npt.NDArray[Any]]] = {}
-
+        yield from bps.open_run(md={"purpose": MEDIAN_SCAN_STREAM})
         for axis, direction in ((x, step), (y, step), (x, -step), (y, -step)):
             for _ in range(frames_per_side):
                 self.logger.debug(f"Moving {axis.name} by {direction} steps.")
+                yield from bps.create(name=MEDIAN_SCAN_STREAM)
                 for det in detectors:
-                    # rd directly returns the "value"
-                    # field of the document
-                    reading = yield from bps.rd(det.buffer)
-                    frames.setdefault(det.buffer.name, []).append(reading)
+                    yield from bps.read(det.buffer)
+                yield from bps.save()
                 yield from bps.mvr(axis, direction)
                 yield from bps.sleep(0.05)
-
-        # TODO: this should be handled by a dedicated presenter;
-        # the median stack should be accumulated in a pseudo device and stored
-        # in raw form on disk; it currently requires some rethinking so
-        # for now we keep it as it is otherwise we'll never finish
-        for det in detectors:
-            buf_name = det.buffer.name  # e.g. "camera-buffer"
-            det_frames = frames.get(buf_name, [])
-            if not det_frames:
-                continue
-            stack = np.stack(det_frames, axis=0)
-            median_frame = np.median(stack, axis=0).astype(stack.dtype)
-            yield from bps.abs_set(det.median.buffer, median_frame, wait=True)
-            yield from bps.abs_set(det.median.buffer_ready, True, wait=True)
-            self.logger.debug(
-                f"Median computed for '{det.name}': "
-                f"{len(det_frames)} frames, shape {median_frame.shape}"
-            )
+        yield from bps.close_run()
 
     @continous(togglable=True)
     def live_stream(
@@ -424,7 +376,8 @@ class AcquisitionPresenter(Presenter, Loggable):
         frames: int = 10,
         write_forever: bool = False,
         /,
-        stream_action: Action = StreamAction(),
+        # the default IS the plan's UI contract (see live_median_scan)
+        stream_action: Action = StreamAction(),  # noqa: B008
     ) -> MsgGenerator[None]:
         """Perform live data collection and optionally store data to disk.
 
@@ -456,9 +409,14 @@ class AcquisitionPresenter(Presenter, Loggable):
 
         yield from bps.open_run()
 
+        # live visualization travels as Event documents, so the viewer sees
+        # frames through the same document sequence as everything else
+        for det in detectors:
+            yield from bps.monitor(det.buffer, name=LIVE_VIEW_STREAM)
+
         while True:
             yield from bps.stage_all(*detectors)
-            yield from prepare_and_kickoff(
+            yield from prepare_and_declare(
                 detectors,
                 trigger_info,
                 stream_name,
@@ -469,16 +427,18 @@ class AcquisitionPresenter(Presenter, Loggable):
                 self.action_map, wait_for="set"
             )
             self.logger.debug("Start writing")
-            yield from set_writing(detectors, True)
+            # kickoff opens the write window: frames were already reaching
+            # viewers from prepare onwards, they now also reach storage
+            yield from bps.kickoff_all(*detectors, wait=True)
             if write_forever:
                 name, current_action = yield from rps.wait_for_actions(
                     self.action_map, wait_for="reset"
                 )
             yield from teardown_acquisition(detectors, stream_name)
-            yield from set_writing(detectors, False)
             self.logger.debug("Writing complete")
             self.clear_and_notify(name, current_action)
 
+    @slot
     def launch_plan(self, plan_name: str, param_values: Mapping[str, Any]) -> None:
         """Launch the specified plan.
 
@@ -497,14 +457,23 @@ class AcquisitionPresenter(Presenter, Loggable):
         resolved = resolve_arguments(spec, param_values, self.models)
         args, kwargs = collect_arguments(spec, resolved)
 
-        self.sigPreLaunchNotify.emit(plan_name)
+        self.sig_pre_launch_notify.emit(plan_name)
         fut = self.engine(plan(*args, **kwargs))
         self.futures.add(fut)
 
         if not spec.togglable:
-            fut.add_done_callback(self.sigPlanDone)
+            fut.add_done_callback(self._notify_plan_done)
 
         fut.add_done_callback(self._discard_future)
+
+    def _notify_plan_done(self, fut: Future[Any]) -> None:
+        """Emit ``sig_plan_done`` when a non-togglable plan future settles.
+
+        ``Future.add_done_callback`` passes the future to its callback,
+        while ``sig_plan_done`` carries no payload; the future is discarded
+        here rather than handed to the signal.
+        """
+        self.sig_plan_done.emit()
 
     def clear_and_notify(self, name: str, event: SRLatch) -> None:
         """Reset the given latch and emit "action done" signal.
@@ -517,8 +486,9 @@ class AcquisitionPresenter(Presenter, Loggable):
             The latch to reset and notify.
         """
         event.reset()
-        self.sigActionDone.emit(name)
+        self.sig_action_done.emit(name)
 
+    @slot
     def toggle_action_event(self, action_name: str, state: bool) -> None:
         """Toggle the event associated with the given action name."""
         event = self.action_map[action_name]
@@ -527,6 +497,7 @@ class AcquisitionPresenter(Presenter, Loggable):
         else:
             self.engine.loop.call_soon_threadsafe(event.reset)
 
+    @slot
     def pause_or_resume_plan(self, pause: bool) -> None:
         """Pause or resume the running plan.
 
@@ -546,6 +517,7 @@ class AcquisitionPresenter(Presenter, Loggable):
             self.futures.add(fut)
             fut.add_done_callback(self._discard_future)
 
+    @slot
     def stop_plan(self) -> None:
         """Stop the running plan."""
         self.engine.stop()
@@ -557,7 +529,7 @@ class AcquisitionPresenter(Presenter, Loggable):
         """
         if len(self.futures) > 0:
             self.logger.debug("Aborting running plan(s) during presenter shutdown.")
-            with self.sigPlanDone.blocked():
+            with self.sig_plan_done.blocked():
                 # temporarily suppress the RequestAbort
                 # exception from bluesky, as it is expected
                 # during shutdown and does not indicate
@@ -580,6 +552,4 @@ class AcquisitionPresenter(Presenter, Loggable):
 
 class _SuppressRequestAbort(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.exc_info and isinstance(record.exc_info[1], RequestAbort):
-            return False
-        return True
+        return not (record.exc_info and isinstance(record.exc_info[1], RequestAbort))

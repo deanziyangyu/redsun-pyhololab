@@ -5,7 +5,7 @@ from ._devices import (
 )
 
 __all__ = [
-    "UC2MotorDevice",
     "UC2LaserDevice",
+    "UC2MotorDevice",
     "UC2Serial",
 ]

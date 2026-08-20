@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 from ophyd_async.core import (
     StandardReadable,
     StandardReadableFormat,
-    soft_signal_rw,
 )
 from pymmcore_plus import CMMCorePlus as Core
 from redsun.log import Loggable
@@ -13,7 +12,6 @@ from redsun.log import Loggable
 from ._backend import (
     mm_property_signal,
 )
-
 from ._common import MMSerialAdapterInfo
 
 if TYPE_CHECKING:

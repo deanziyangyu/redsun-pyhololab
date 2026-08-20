@@ -1,29 +1,24 @@
 from __future__ import annotations
 
-import abc
 import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
 
-import aiologic
-import numpy as np
 from ophyd_async.core import (
     DetectorAcquireLogic,
     DetectorDataLogic,
     DetectorTriggerLogic,
     StreamResourceDataProvider,
-    StreamResourceInfo,
     TriggerInfo,
 )
 from redsun.log import Loggable
-from redsun.storage import SourceInfo
+from redsun.storage import StreamSpec
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ophyd_async.core import PathProvider, SignalRW
-    from ophyd_async.core._data_providers import StreamableDataProvider
-    from redsun.storage import DataWriter
+    from ophyd_async.core import SignalRW, StreamableDataProvider
+    from redsun.storage import BaseStorage, FrameSink
 
     from redsun_mimir.protocols import ROIType
 
@@ -32,30 +27,53 @@ AxisType = Literal["x", "y", "z"]
 DEFAULT_TIMEOUT: Final[float] = 5.0
 
 
+async def get_shape_and_dtype(
+    roi: SignalRW[ROIType], dtype: SignalRW[str]
+) -> tuple[tuple[int, int], str]:
+    """Compute a frame's ``(height, width)`` shape and dtype from device signals.
+
+    Parameters
+    ----------
+    roi : SignalRW[ROIType]
+        Signal carrying the current region of interest, ``[x, y, width, height]``.
+    dtype : SignalRW[str]
+        Signal carrying the current pixel dtype (e.g. ``"uint16"``).
+    """
+    shape_array, np_dtype = await asyncio.gather(roi.get_value(), dtype.get_value())
+    shape = tuple(shape_array.tolist())
+    if len(shape) != 4:
+        raise ValueError(f"Expected shape array of length 4, got {len(shape)}")
+    return (shape[2] - shape[0], shape[3] - shape[1]), np_dtype
+
+
 @dataclass
 class BaseTriggerLogic(DetectorTriggerLogic):
+    """Trigger logic registering a stream with the shared storage.
+
+    Stashes the requested frame count on the sibling ``acquire`` logic so
+    [`BaseDataLogic`][redsun_mimir.device._logics.BaseDataLogic] can derive
+    the same capacity when it registers its `StreamResourceDataProvider`.
+    """
+
     datakey_name: str
-    writer: DataWriter
+    storage: BaseStorage
+    acquire: BaseAcquireLogic
     roi: SignalRW[ROIType]
     dtype: SignalRW[str]
 
     async def prepare_internal(
         self, num: int, livetime: float, deadtime: float
     ) -> None:
-        shape, np_dtype = await self._get_shape_and_dtype()
-        self.writer.register(
-            self.datakey_name,
-            SourceInfo(dtype_numpy=np_dtype, shape=shape, capacity=num),
+        shape, np_dtype = await get_shape_and_dtype(self.roi, self.dtype)
+        self.acquire.num = num
+        self.storage.register(
+            StreamSpec(
+                data_key=self.datakey_name,
+                shape=shape,
+                dtype=np_dtype,
+                capacity=num or None,
+            )
         )
-
-    async def _get_shape_and_dtype(self) -> tuple[tuple[int, ...], str]:
-        shape_array, np_dtype = await asyncio.gather(
-            self.roi.get_value(), self.dtype.get_value()
-        )
-        shape = tuple(shape_array.tolist())
-        if len(shape) != 4:
-            raise ValueError(f"Expected shape array of length 4, got {len(shape)}")
-        return (shape[2] - shape[0], shape[3] - shape[1]), np_dtype
 
     async def default_trigger_info(self) -> TriggerInfo:
         return TriggerInfo(number_of_events=0)
@@ -63,127 +81,82 @@ class BaseTriggerLogic(DetectorTriggerLogic):
 
 @dataclass
 class BaseAcquireLogic(DetectorAcquireLogic, Loggable):
-    _pump_task: asyncio.Task[None] | None = field(default=None, init=False)
-    _arm_event: aiologic.REvent = field(init=False)
-    _disarm_event: aiologic.REvent = field(init=False)
+    """Shared acquire-logic state for continuous, buffer-fed detectors.
 
-    def __post_init__(self) -> None:
-        self._arm_event = aiologic.REvent()
-        self._disarm_event = aiologic.REvent()
+    Frames always flow to the device's buffer signal for viewers; they flow
+    into `storage` only while a write window is active - the sink handed over
+    at `prepare` (`pending_sink`) becomes live (`sink`) at kickoff
+    (`start_acquiring`), so storage never sees a frame it will not write.
+    Subclasses provide the hardware polling loop and must implement
+    `ensure_ready`/`ensure_stopped` to start and stop it, calling
+    `_close_sinks` from `ensure_stopped` once the loop has really stopped.
+    """
 
-    async def ensure_ready(self) -> None:
-        await super().ensure_ready()
-        self._arm_event.clear()
-        self._disarm_event.clear()
-        self._pump_task = asyncio.create_task(self.pump())
+    num: int = field(default=0, init=False)
+    pending_sink: FrameSink | None = field(default=None, init=False)
+    sink: FrameSink | None = field(default=None, init=False)
 
     async def start_acquiring(self) -> None:
-        self._arm_event.set()
+        """Activate the write window: the pending sink becomes live."""
+        if self.pending_sink is not None:
+            self.sink, self.pending_sink = self.pending_sink, None
 
     async def wait_for_idle(self) -> None:
-        # TODO: idle event should be waited here,
-        # but i'm not sure if the event is even needed
-        ...
+        return None
 
-    async def ensure_stopped(self) -> None:
-        if self._pump_task is not None:
-            self._disarm_event.set()
-            await self._pump_task
-            self._pump_task = None
-        self._disarm_event.clear()
-
-    @abc.abstractmethod
-    async def pump(self) -> None: ...
+    def _close_sinks(self) -> None:
+        """Close any live or pending sink. Idempotent."""
+        for candidate in (self.sink, self.pending_sink):
+            if candidate is not None:
+                candidate.close()
+        self.sink = None
+        self.pending_sink = None
 
 
 @dataclass
 class BaseDataLogic(DetectorDataLogic, Loggable):
-    writer: DataWriter
-    path_provider: PathProvider
+    """Data logic building a `StreamResourceDataProvider` from shared storage.
 
-    _drain_task: asyncio.Task[None] | None = field(default=None, init=False)
-    _drain_ready_event: aiologic.REvent = field(init=False)
+    Parameters
+    ----------
+    storage : BaseStorage
+        Backend this detector writes to.
+    acquire : BaseAcquireLogic
+        Sibling acquire logic; receives the sink and supplies the capacity
+        registered by the sibling trigger logic.
+    roi, dtype : SignalRW
+        Signals used to derive the frame shape and dtype.
+    eager_open : bool
+        If True, `open()` the backend at prepare time. Only legal when this
+        detector exclusively owns its storage group - a sibling's `register`
+        would otherwise race the open and raise `StoreStateError`.
+        Shared-storage detectors must pass `False` and rely on the drain's
+        lazy open.
+    """
 
-    def __post_init__(self) -> None:
-        self._drain_ready_event = aiologic.REvent()
-        self._store_path = ""
-
-    def close_writer_if_idle(self) -> None:
-        """Close the writer if all datakeys have been unregistered."""
-        if len(self.writer.sources) == 0 and self.writer.is_open:
-            self.writer.close(reset_path=False)
-
-    def get_store_path(self) -> str:
-        """Get the current store path of the writer.
-
-        Returns
-        -------
-            str: The current DataWriter store path.
-        """
-        path = self.writer.get_store_path()
-        if path is None:
-            raise RuntimeError("Writer path is not set.")
-        return str(path)
+    storage: BaseStorage
+    acquire: BaseAcquireLogic
+    roi: SignalRW[ROIType]
+    dtype: SignalRW[str]
+    eager_open: bool = True
 
     def get_hinted_fields(self, datakey_name: str) -> Sequence[str]:
         return [datakey_name]
 
-    async def should_allocate_path(self) -> bool:
-        """Return True if prepare_unbounded should call path_provider."""
-        return True
-
     async def prepare_unbounded(self, datakey_name: str) -> StreamableDataProvider:
-        extension = self.writer.file_extension
-        if not self.writer.is_path_set():
-            if await self.should_allocate_path():
-                path_info = self.path_provider(datakey_name)
-                write_path = path_info.directory_path / ".".join(
-                    [path_info.filename, extension]
-                )
-                self.writer.set_store_path(write_path)
-                self._store_path = str(write_path)
-                self.logger.debug(f"Writer path set to {write_path}")
-        else:
-            self._store_path = self.get_store_path()
-
-        shape = self.writer.sources[datakey_name].shape
-        capacity = self.writer.sources[datakey_name].capacity
-        dtype_numpy = np.dtype(self.writer.sources[datakey_name].dtype_numpy).str
-
-        self._drain_task = asyncio.create_task(self._drain(datakey_name))
-
-        # wait until the drain loop is ready before returning the provider
-        await self._drain_ready_event
-
-        # when unlimited capacity is requested, the time axis of
-        # shape requires a None flag to indicate it grows indefinetely
-        actual_capacity = capacity if capacity > 0 else None
-
-        data_resource = StreamResourceInfo(
+        self.acquire.pending_sink = self.storage.sink(datakey_name)
+        if self.eager_open:
+            await self.storage.open()
+        shape, np_dtype = await get_shape_and_dtype(self.roi, self.dtype)
+        spec = StreamSpec(
             data_key=datakey_name,
-            shape=(actual_capacity, *shape),
-            chunk_shape=shape,
-            dtype_numpy=dtype_numpy,
-            parameters={},
+            shape=shape,
+            dtype=np_dtype,
+            capacity=self.acquire.num or None,
         )
-
-        sig = self.writer.get_counter(datakey_name)
         return StreamResourceDataProvider(
-            uri=self._store_path,
-            resources=[data_resource],
-            mimetype=self.writer.mimetype,
-            collections_written_signal=sig,
+            uri=self.storage.uri_for(datakey_name),
+            resources=[self.storage.resource_info_for(spec)],
+            mimetype=self.storage.mimetype,
+            collections_written_signal=self.storage.signal_for(datakey_name),
         )
-
-    async def stop(self) -> None:
-        if self._drain_task is not None:
-            self._drain_task.cancel()
-            await self._drain_task
-            self._drain_task = None
-        self._drain_ready_event.clear()
-        if self.writer.is_path_set() and not self.writer.is_open:
-            self.writer.reset_store_path()
-            self._store_path = ""
-
-    @abc.abstractmethod
-    async def _drain(self, datakey_name: str) -> None: ...

@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
-from dependency_injector import providers
 from redsun.aio import run_coro
 from redsun.device.protocols import HasAsyncShutdown
 from redsun.log import Loggable
 from redsun.presenter import Presenter
-from redsun.utils import find_signals
+from redsun.virtual import slot
 
-from redsun_mimir.protocols import LightProtocol  # noqa: TC001
+from redsun_mimir.protocols import LightProtocol
+from redsun_mimir.providers import LIGHT_CONFIGURATION, LIGHT_DESCRIPTION
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -53,6 +53,7 @@ class LightPresenter(Presenter, Loggable):
             for name, device in devices.items()
             if isinstance(device, LightProtocol)
         }
+        self._locks = {name: asyncio.Lock() for name in self._lights}
         if not self._lights:
             self.logger.warning("No device found.")
         else:
@@ -89,51 +90,24 @@ class LightPresenter(Presenter, Loggable):
 
     def register_providers(self, container: VirtualContainer) -> None:
         """Register light model info as a provider in the DI container."""
-        container.light_configuration = providers.Object(self.device_configuration())
-        container.light_description = providers.Object(self.device_description())
+        container.provide(LIGHT_CONFIGURATION, self.device_configuration())
+        container.provide(LIGHT_DESCRIPTION, self.device_description())
         container.register_signals(self)
 
-    def inject_dependencies(self, container: VirtualContainer) -> None:
-        """Connect to the virtual container signals."""
-        sigs = find_signals(
-            container,
-            [
-                "sigToggleLightRequest",
-                "sigIntensityRequest",
-                "sigChannelEnableRequest",
-                "sigChannelLevelRequest",
-            ],
-        )
-        if "sigToggleLightRequest" in sigs:
-            sigs["sigToggleLightRequest"].connect(
-                lambda name: run_coro(self.trigger(name))
-            )
-        if "sigIntensityRequest" in sigs:
-            sigs["sigIntensityRequest"].connect(
-                lambda name, intensity: run_coro(self.set(name, intensity))
-            )
-        if "sigChannelEnableRequest" in sigs:
-            sigs["sigChannelEnableRequest"].connect(
-                lambda name, channel, value: run_coro(
-                    self.set_channel_enable(name, channel, value)
-                )
-            )
-        if "sigChannelLevelRequest" in sigs:
-            sigs["sigChannelLevelRequest"].connect(
-                lambda name, channel, level: run_coro(
-                    self.set_channel_level(name, channel, level)
-                )
-            )
-
+    @slot
     async def trigger(self, name: str) -> None:
-        """Toggle a light source and emit the new state on completion."""
-        light = self._lights[name]
-        await asyncio.wait_for(light.trigger(), timeout=self._timeout)
-        state = await light.enabled.get_value()
-        self.logger.debug(f"Toggled {name!r} -> enabled={state}")
+        """Toggle a light source and log the new state on completion."""
+        # toggling reads and flips device state, so two overlapping requests
+        # would race; intensity is absolute and needs no such guard
+        async with self._locks[name]:
+            light = self._lights[name]
+            await asyncio.wait_for(light.trigger(), timeout=self._timeout)
+            state = await light.enabled.get_value()
+            self.logger.debug(f"Toggled {name!r} -> enabled={state}")
 
-    async def set(self, name: str, intensity: int | float) -> None:
-        """Set the intensity of a light source.
+    @slot
+    async def set(self, name: str, intensity: float) -> None:
+        """Set the intensity of a light source, unless it is binary.
 
         Parameters
         ----------
@@ -143,47 +117,10 @@ class LightPresenter(Presenter, Loggable):
             New intensity value.
         """
         light = self._lights[name]
+        if await light.binary.get_value():
+            self.logger.warning(f"{name!r} is a binary light source; intensity ignored")
+            return
         await asyncio.wait_for(light.intensity.set(intensity), timeout=self._timeout)
-
-    async def set_channel_enable(self, name: str, channel: str, value: str) -> None:
-        """Enable or disable a single channel on a light device.
-
-        Parameters
-        ----------
-        name : str
-            Name of the light device.
-        channel : str
-            Channel name (e.g. ``"Cyan"``).
-        value : str
-            ``"1"`` to enable, ``"0"`` to disable.
-        """
-        light = self._lights[name]
-        sig = getattr(light, f"{channel.lower()}_enable", None)
-        if sig is None:
-            self.logger.warning("Channel %r not found on device %r", channel, name)
-            return
-        await sig.set(value)
-        self.logger.debug("Set %s %s enable -> %s", name, channel, value)
-
-    async def set_channel_level(self, name: str, channel: str, level: int) -> None:
-        """Set the power level of a single channel.
-
-        Parameters
-        ----------
-        name : str
-            Name of the light device.
-        channel : str
-            Channel name (e.g. ``"Cyan"``).
-        level : int
-            Power level (0-100).
-        """
-        light = self._lights[name]
-        sig = getattr(light, f"{channel.lower()}_level", None)
-        if sig is None:
-            self.logger.warning("Channel %r not found on device %r", channel, name)
-            return
-        await sig.set(level)
-        self.logger.debug("Set %s %s level -> %d", name, channel, level)
 
     def shutdown(self) -> None:
         """Shutdown the presenter and all light devices."""

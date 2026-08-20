@@ -2,264 +2,282 @@
 
 from __future__ import annotations
 
-import os
-import sys
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any
 
 import pytest
-from dependency_injector import providers
-from qtpy.QtWidgets import QApplication
-from redsun.virtual import VirtualContainer
+from redsun.virtual import ProviderKey, VirtualContainer
 
-from redsun_mimir.device._mocks import MockLightDevice
-from redsun_mimir.device.mmcore import MMDemoXYStage
 from redsun_mimir.presenter.light import LightPresenter
 from redsun_mimir.presenter.motor import MotorPresenter
+from redsun_mimir.providers import (
+    LIGHT_CONFIGURATION,
+    LIGHT_DESCRIPTION,
+    MOTOR_DESCRIPTION,
+    MOTOR_READBACKS,
+    MOTOR_READINGS,
+)
 from redsun_mimir.view.light import LightView
 from redsun_mimir.view.motor import MotorView
 
+if TYPE_CHECKING:
+    from bluesky.protocols import Reading
 
-def _make_container(**objects: Any) -> VirtualContainer:
+    from redsun_mimir.device._mocks import MockLightDevice
+
+    from .conftest import FakeXYStage
+
+pytestmark = pytest.mark.qt
+
+
+def _reading(key: str, value: float) -> dict[str, Reading[Any]]:
+    """Build the one-entry reading dict a signal subscription delivers."""
+    return {key: {"value": value, "timestamp": 0.0}}
+
+
+def _make_container(*bindings: tuple[ProviderKey[Any], Any]) -> VirtualContainer:
     container = VirtualContainer()
-    for name, value in objects.items():
-        setattr(container, name, providers.Object(value))
+    for key, value in bindings:
+        container.provide(key, value)
     return container
 
 
-async def _build_motor_view(
-    widget: MotorView,
-    xy_mock_motor: MMDemoXYStage,
-    container: VirtualContainer | None = None,
-) -> VirtualContainer:
-    """Full build sequence: register_providers then inject_dependencies."""
-    if container is None:
-        container = _make_container(
-            motor_configuration=await xy_mock_motor.read_configuration(),
-            motor_description=await xy_mock_motor.describe_configuration(),
-        )
+async def _build_motor_view(widget: MotorView, motor: FakeXYStage) -> VirtualContainer:
+    """Drive the real build order: register_providers then inject_dependencies."""
+    container = _make_container(
+        (MOTOR_READINGS, await motor.read()),
+        (MOTOR_DESCRIPTION, await motor.describe()),
+        (
+            MOTOR_READBACKS,
+            {a.name: a.movable_logic.readback for a in motor.axis.values()},
+        ),
+    )
     widget.register_providers(container)
     widget.inject_dependencies(container)
     return container
 
 
 async def _build_light_view(
-    widget: LightView,
-    *devices: MockLightDevice,
-    container: VirtualContainer | None = None,
+    widget: LightView, *devices: MockLightDevice
 ) -> VirtualContainer:
-    """Full build sequence: register_providers then inject_dependencies."""
-    if container is None:
-        cfg: dict[str, Any] = {}
-        desc: dict[str, Any] = {}
-        for dev in devices:
-            cfg.update(await dev.read_configuration())
-            desc.update(await dev.describe_configuration())
-        container = _make_container(
-            light_configuration=cfg,
-            light_description=desc,
-        )
+    """Drive the real build order: register_providers then inject_dependencies."""
+    # mirrors LightPresenter.device_configuration/_description: the view needs
+    # both the config signals (wavelength) and the readables (intensity)
+    configuration: dict[str, Any] = {}
+    description: dict[str, Any] = {}
+    for device in devices:
+        configuration.update(await device.read_configuration())
+        configuration.update(await device.read())
+        description.update(await device.describe_configuration())
+        description.update(await device.describe())
+    container = _make_container(
+        (LIGHT_CONFIGURATION, configuration),
+        (LIGHT_DESCRIPTION, description),
+    )
     widget.register_providers(container)
     widget.inject_dependencies(container)
     return container
 
 
-@pytest.mark.skipif(
-    sys.platform == "linux" and not os.environ.get("DISPLAY"),
-    reason="requires a display (Qt) on Linux",
-)
 class TestMotorView:
     """Tests for MotorView."""
 
     @pytest.fixture
-    def widget(
-        self, qapp: QApplication, virtual_container: VirtualContainer
-    ) -> MotorView:
+    def widget(self) -> MotorView:
         return MotorView("motor_view")
 
-    def test_instantiation(self, widget: MotorView) -> None:
-        """Widget creates without error before inject_dependencies."""
-        assert widget is not None
-
-    async def test_register_providers_builds_ui(
-        self, widget: MotorView, xy_mock_motor: MMDemoXYStage
+    async def test_build_creates_one_group_per_axis(
+        self, widget: MotorView, motor_stage: FakeXYStage
     ) -> None:
-        """register_providers() + inject_dependencies() populates group boxes, labels, and buttons."""
-        await _build_motor_view(widget, xy_mock_motor)
+        """The UI is derived from the ``<device>-axis-<name>`` reading keys."""
+        await _build_motor_view(widget, motor_stage)
 
         assert "xystage" in widget._groups
-        assert "pos:xystage:x" in widget._labels
-        assert "pos:xystage:y" in widget._labels
-        assert "button:xystage:x:up" in widget._buttons
-        assert "button:xystage:x:down" in widget._buttons
+        for axis in ("x", "y"):
+            assert f"pos:xystage:{axis}" in widget._labels
+            assert f"button:xystage:{axis}:up" in widget._buttons
+            assert f"button:xystage:{axis}:down" in widget._buttons
 
-    async def test_step_size_initialised_from_device(
-        self, widget: MotorView, xy_mock_motor: MMDemoXYStage
+    async def test_step_size_comes_from_the_view(
+        self, widget: MotorView, motor_stage: FakeXYStage
     ) -> None:
-        """Step size line edits are seeded from device step_sizes."""
-        await _build_motor_view(widget, xy_mock_motor)
+        """Step size is the view's own parameter, not a device property."""
+        widget = MotorView("motor_view", step_size=2.5)
+        await _build_motor_view(widget, motor_stage)
 
-        assert widget._line_edits["edit:xystage:x"].text() == "0.015"
-        assert widget._line_edits["edit:xystage:y"].text() == "0.015"
+        assert widget._line_edits["edit:xystage:x"].text() == "2.5"
 
-    async def test_update_position_changes_label(
-        self, widget: MotorView, xy_mock_motor: MMDemoXYStage
+    async def test_update_setpoint_refreshes_label(
+        self, widget: MotorView, motor_stage: FakeXYStage
     ) -> None:
-        """_update_position() refreshes the position label text."""
-        await _build_motor_view(widget, xy_mock_motor)
+        await _build_motor_view(widget, motor_stage)
 
-        widget._update_position("xystage", "x", 7.5)
-        assert "7.50" in widget._labels["pos:xystage:x"].text()
+        widget.update_setpoint(_reading("xystage-axis-x", 7.5))
+        assert widget._labels["pos:xystage:x"].text().startswith("7.50")
 
-    async def test_step_up_emits_signal(
-        self, widget: MotorView, xy_mock_motor: MMDemoXYStage
-    ) -> None:
-        """Clicking the '+' button emits sigMotorMove with position + step."""
-        await _build_motor_view(widget, xy_mock_motor)
-
-        received: list[tuple[str, str, float]] = []
-        widget.sigMotorMove.connect(lambda m, a, p: received.append((m, a, p)))
-
-        widget._step("xystage", "x", direction_up=True)
-        assert len(received) == 1
-        assert received[0] == ("xystage", "x", cast("float", pytest.approx(0.015)))
-
-    async def test_step_down_emits_signal(
-        self, widget: MotorView, xy_mock_motor: MMDemoXYStage
-    ) -> None:
-        """Clicking the '-' button emits sigMotorMove with position - step."""
-        await _build_motor_view(widget, xy_mock_motor)
-
-        received: list[tuple[str, str, float]] = []
-        widget.sigMotorMove.connect(lambda m, a, p: received.append((m, a, p)))
-
-        widget._step("xystage", "x", direction_up=False)
-        assert len(received) == 1
-        assert received[0] == ("xystage", "x", cast("float", pytest.approx(-0.015)))
-
-    async def test_inject_dependencies_registers_signals(
+    @pytest.mark.parametrize(
+        ("direction_up", "expected"),
+        [
+            pytest.param(True, 10.0, id="step-up"),
+            pytest.param(False, -10.0, id="step-down"),
+        ],
+    )
+    async def test_step_emits_a_displacement_not_a_target(
         self,
         widget: MotorView,
-        xy_mock_motor: MMDemoXYStage,
+        motor_stage: FakeXYStage,
+        direction_up: bool,
+        expected: float,
+    ) -> None:
+        """The step size travels as-is, whatever the position label says.
+
+        The label is not read at all: if it were, two clicks arriving before it
+        refreshed would both compute the same absolute target and the second
+        would move nothing.
+        """
+        await _build_motor_view(widget, motor_stage)
+        widget.update_setpoint(_reading("xystage-axis-x", 123.0))
+
+        received: list[tuple[str, str, float]] = []
+        widget.sig_motor_move.connect(
+            lambda motor, axis, delta: received.append((motor, axis, delta))
+        )
+
+        widget._step("xystage", "x", direction_up=direction_up)
+
+        assert len(received) == 1
+        motor, axis, delta = received[0]
+        assert (motor, axis) == ("xystage", "x")
+        assert delta == pytest.approx(expected)
+
+    async def test_label_follows_a_move_the_presenter_never_made(
+        self,
+        widget: MotorView,
+        motor_stage: FakeXYStage,
         virtual_container: VirtualContainer,
     ) -> None:
-        """register_providers() registers the widget signals; inject_dependencies() connects inbound signals."""
-        # Presenter registers first so its signals and providers exist on the container
-        ctrl = MotorPresenter("motor_presenter", {"xystage": xy_mock_motor})
-        ctrl.register_providers(virtual_container)
+        """The label reports the axis, not the last request the view sent.
 
-        # View register_providers then inject_dependencies in the correct build order
+        The axis is moved directly, exactly as a plan running in the
+        `RunEngine` would move it: nothing passes through the presenter, and
+        the label still tracks it.
+        """
+        presenter = MotorPresenter("motor_ctrl", {"xystage": motor_stage})
+        presenter.register_providers(virtual_container)
         widget.register_providers(virtual_container)
         widget.inject_dependencies(virtual_container)
-        ctrl.shutdown()
 
         assert "motor_view" in virtual_container.signals
 
+        await motor_stage.axis["x"].set(3.25)
+        assert widget._labels["pos:xystage:x"].text().startswith("3.25")
 
-@pytest.mark.skipif(
-    sys.platform == "linux" and not os.environ.get("DISPLAY"),
-    reason="requires a display (Qt) on Linux",
-)
+        presenter.shutdown()
+
+
 class TestLightView:
     """Tests for LightView."""
 
     @pytest.fixture
-    async def led(self) -> MockLightDevice:
-        device = MockLightDevice(
-            "led", wavelength=450, binary=True, intensity_range=(0, 0)
-        )
-        await device.connect(mock=True)
-        return device
-
-    @pytest.fixture
-    async def laser(self) -> MockLightDevice:
-        device = MockLightDevice(
-            "laser", wavelength=650, egu="mW", intensity_range=(0, 100), step_size=1
-        )
-        await device.connect(mock=True)
-        return device
-
-    @pytest.fixture
-    def widget(
-        self, qapp: QApplication, virtual_container: VirtualContainer
-    ) -> LightView:
+    def widget(self) -> LightView:
         return LightView("light_view")
 
-    def test_instantiation(self, widget: LightView) -> None:
-        """Widget creates without error before inject_dependencies."""
-        assert widget is not None
-
-    async def test_inject_binary_light(
-        self, widget: LightView, led: MockLightDevice
+    async def test_build_creates_button_and_slider(
+        self, widget: LightView, mock_laser: MockLightDevice
     ) -> None:
-        """register_providers() + inject_dependencies() with binary device creates only an ON/OFF button."""
-        await _build_light_view(widget, led)
-
-        assert "led" in widget._groups
-        assert "on:led" in widget._buttons
-        assert "power:led" not in widget._sliders
-
-    async def test_inject_continuous_light(
-        self, widget: LightView, laser: MockLightDevice
-    ) -> None:
-        """register_providers() + inject_dependencies() with continuous device creates a button and slider."""
-        await _build_light_view(widget, laser)
+        await _build_light_view(widget, mock_laser)
 
         assert "laser" in widget._groups
         assert "on:laser" in widget._buttons
         assert "power:laser" in widget._sliders
 
-    async def test_toggle_button_emits_signal(
-        self, widget: LightView, led: MockLightDevice
+    async def test_binary_source_gets_no_slider(
+        self, widget: LightView, mock_binary_led: MockLightDevice
     ) -> None:
-        """Clicking the ON button emits sigToggleLightRequest with the device name."""
-        await _build_light_view(widget, led)
+        """A binary source offers on/off and nothing else."""
+        await _build_light_view(widget, mock_binary_led)
 
-        received: list[str] = []
-        widget.sigToggleLightRequest.connect(received.append)
+        assert "on:binary_led" in widget._buttons
+        assert "power:binary_led" not in widget._sliders
 
-        widget._on_toggle_button_checked("led")
-        assert received == ["led"]
-
-    async def test_toggle_button_text_changes(
-        self, widget: LightView, led: MockLightDevice
+    async def test_slider_range_follows_device_limits(
+        self, widget: LightView, mock_laser: MockLightDevice
     ) -> None:
-        """Toggle button label switches between ON and OFF."""
-        await _build_light_view(widget, led)
+        await _build_light_view(widget, mock_laser)
 
-        btn = widget._buttons["on:led"]
-        assert btn.text() == "ON"
-        btn.setChecked(True)
-        widget._on_toggle_button_checked("led")
-        assert btn.text() == "OFF"
-        btn.setChecked(False)
-        widget._on_toggle_button_checked("led")
-        assert btn.text() == "ON"
+        slider = widget._sliders["power:laser"]
+        assert (slider.minimum(), slider.maximum()) == (0.0, 100.0)
 
-    async def test_slider_change_emits_signal(
-        self, widget: LightView, laser: MockLightDevice
-    ) -> None:
-        """Moving the intensity slider emits sigIntensityRequest."""
-        await _build_light_view(widget, laser)
-
-        received: list[tuple[str, Any]] = []
-        widget.sigIntensityRequest.connect(lambda n, v: received.append((n, v)))
-
-        widget._on_slider_changed(50, "laser")
-        assert len(received) == 1
-        assert received[0][0] == "laser"
-        assert received[0][1] == 50
-
-    async def test_inject_dependencies_registers_signals(
+    async def test_build_handles_multiple_devices(
         self,
         widget: LightView,
-        led: MockLightDevice,
+        mock_led: MockLightDevice,
+        mock_laser: MockLightDevice,
+    ) -> None:
+        await _build_light_view(widget, mock_led, mock_laser)
+
+        assert {"led", "laser"} <= set(widget._groups)
+
+    async def test_toggle_emits_and_relabels(
+        self, widget: LightView, mock_led: MockLightDevice
+    ) -> None:
+        await _build_light_view(widget, mock_led)
+
+        received: list[str] = []
+        widget.sig_toggle_light_request.connect(received.append)
+        button = widget._buttons["on:led"]
+
+        assert button.text() == "ON"
+        button.setChecked(True)
+        widget._on_toggle_button_checked("led")
+        assert button.text() == "OFF"
+        button.setChecked(False)
+        widget._on_toggle_button_checked("led")
+        assert button.text() == "ON"
+
+        assert received == ["led", "led"]
+
+    async def test_slider_change_emits_intensity_request(
+        self, widget: LightView, mock_laser: MockLightDevice
+    ) -> None:
+        await _build_light_view(widget, mock_laser)
+
+        received: list[tuple[str, Any]] = []
+        widget.sig_intensity_request.connect(
+            lambda name, value: received.append((name, value))
+        )
+
+        widget._on_slider_changed(50, "laser")
+
+        assert received == [("laser", 50)]
+
+    async def test_non_numeric_intensity_is_rejected(
+        self, widget: LightView, mock_led: MockLightDevice
+    ) -> None:
+        """The view has no binary branch: a non-numeric dtype must raise."""
+        readings: dict[str, Any] = {
+            **await mock_led.read_configuration(),
+            **await mock_led.read(),
+        }
+        description: dict[str, Any] = {
+            **await mock_led.describe_configuration(),
+            **await mock_led.describe(),
+        }
+        description["led-intensity"] = {
+            **description["led-intensity"],
+            "dtype": "string",
+        }
+
+        with pytest.raises(TypeError, match="'number' or 'integer'"):
+            widget.setup_ui(readings, description)
+
+    async def test_registers_signals_on_the_container(
+        self,
+        widget: LightView,
+        mock_led: MockLightDevice,
         virtual_container: VirtualContainer,
     ) -> None:
-        """register_providers() registers the widget signals; inject_dependencies() builds the UI."""
-        ctrl = LightPresenter("light_presenter", {"led": led})
-        ctrl.register_providers(virtual_container)
-
-        # View register_providers then inject_dependencies in the correct build order
+        presenter = LightPresenter("light_ctrl", {"led": mock_led})
+        presenter.register_providers(virtual_container)
         widget.register_providers(virtual_container)
         widget.inject_dependencies(virtual_container)
 

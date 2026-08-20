@@ -13,15 +13,12 @@ from ophyd_async.core import (
     AsyncConfigurable,
     AsyncReadable,
     AsyncStageable,
+    StandardMovable,
 )
-from redsun.storage.protocols import HasWriterLogic
 
 if TYPE_CHECKING:
     from bluesky.protocols import Descriptor, Reading
-    from ophyd_async.core import AsyncStatus, SignalR, SignalRW
-    from redsun.device import DeviceMap
-
-    from redsun_mimir.device.median import MedianDevice
+    from ophyd_async.core import AsyncStatus, DeviceMap, SignalR, SignalRW
 
 T = TypeVar("T", int, float)
 
@@ -46,8 +43,12 @@ class LayerSpec(TypedDict):
 class MotorProtocol(AsyncReadable, Protocol):
     """Protocol for individual motor axes."""
 
-    axis: DeviceMap[SignalRW[float]]
-    """Map of axis names to settable signals."""
+    axis: DeviceMap[StandardMovable[float]]
+    """Map of axis names to movable axes.
+
+    ``locate`` reports the commanded setpoint and the measured readback
+    separately; a controller that cannot be queried reports them as equal.
+    """
 
 
 @runtime_checkable
@@ -65,6 +66,9 @@ class LightProtocol(AsyncConfigurable, Protocol):
         Read-only signal reflecting the current on/off state.
         Updated internally each time [`trigger`][redsun_mimir.protocols.LightProtocol.trigger]
         is called.
+    binary :
+        Read-only signal marking the source as on/off only.
+        A binary source refuses intensity changes.
     """
 
     intensity: SignalRW[int | float]
@@ -74,6 +78,9 @@ class LightProtocol(AsyncConfigurable, Protocol):
 
     enabled: SignalRW[bool]
     """Current on/off state of the light source."""
+
+    binary: SignalR[bool]
+    """Whether the source is on/off only, ignoring ``intensity``."""
 
     async def read(self) -> dict[str, Reading[Any]]:
         """Read the current state of the light source.
@@ -135,28 +142,18 @@ class ReadableFlyer(
     Flyable,
     Collectable,
     WritesStreamAssets,
-    HasWriterLogic,
     Protocol,
 ):
     """Protocol for objects that can write to disk."""
 
-    write_sig: SignalRW[bool]
-    """Signal to control whether the device should write data to disk during acquisition."""
-
-
-@runtime_checkable
-class MedianFlyer(ReadableFlyer, Protocol):
-    """Protocol for a median device that computes the median of a stack of images."""
-
-    median: MedianDevice
-    """The median device, which provides the computed median image."""
-
 
 __all__ = [
+    "Array2D",
+    "BufferDataProtocol",
     "DetectorProtocol",
+    "LayerSpec",
     "LightProtocol",
     "MotorProtocol",
-    "ReadableFlyer",
     "ROIType",
-    "Array2D",
+    "ReadableFlyer",
 ]

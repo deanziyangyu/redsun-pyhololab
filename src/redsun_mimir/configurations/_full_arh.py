@@ -13,8 +13,8 @@ def run_arh_container() -> None:
     """Run the full ARH microscope with pre-shipped configuration."""
     # devices
     from redsun_mimir.device.mmcore import (
-        MMASIFWController,
         MMASIFilterWheel,
+        MMASIFWController,
         MMASIXYStage,
         MMASIZStage,
         MMHamamatsuCamera,

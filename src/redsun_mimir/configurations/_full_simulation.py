@@ -4,23 +4,28 @@ import logging
 from pathlib import Path
 
 from redsun.containers import declare_device, declare_presenter, declare_view
+from redsun.presenter.builtins import StoragePresenter
 from redsun.qt import QtAppContainer
+from redsun.view.qt.builtins import StorageView
+
+from ._wiring import (
+    wire_acquisition,
+    wire_detector,
+    wire_light,
+    wire_median,
+    wire_motor,
+)
 
 _CONFIG = Path(__file__).parent / "full_configuration.yaml"
 
 
-def run_simulation_container() -> None:
-    """Run a local mock example.
-
-    Launches a simulation with the full stack
-    provided by mimir with mock devices.
-    """
+def build_simulation_container() -> QtAppContainer:
+    """Return the example container, unbuilt (see `build_acquisition_container`)."""
     # devices
-    from redsun_mimir.device import MockLightDevice  # noqa: I001
-    from redsun_mimir.device.mmcore import MMDemoCamera, MMDemoXYStage, MMDemoZStage  # noqa: I001
+    from redsun_mimir.device import MockLightDevice
+    from redsun_mimir.device.mmcore import MMDemoCamera, MMDemoXYStage, MMDemoZStage
 
     # presenters
-    from redsun_mimir.presenter.storage import FileStoragePresenter
     from redsun_mimir.presenter.acquisition import AcquisitionPresenter
     from redsun_mimir.presenter.detector import DetectorPresenter
     from redsun_mimir.presenter.light import LightPresenter
@@ -33,7 +38,6 @@ def run_simulation_container() -> None:
     from redsun_mimir.view.image import ImageView
     from redsun_mimir.view.light import LightView
     from redsun_mimir.view.motor import MotorView
-    from redsun_mimir.view.storage import FileStorageView
 
     logging.getLogger("redsun").setLevel(logging.DEBUG)
 
@@ -46,9 +50,7 @@ def run_simulation_container() -> None:
         led = declare_device(MockLightDevice, from_config="led")
 
         # presenters
-        storage_ctrl = declare_presenter(
-            FileStoragePresenter, from_config="storage_ctrl"
-        )
+        storage_ctrl = declare_presenter(StoragePresenter, from_config="storage_ctrl")
         median_ctrl = declare_presenter(MedianPresenter, from_config="median_ctrl")
         det_ctrl = declare_presenter(DetectorPresenter, from_config="det_ctrl")
         acq_ctrl = declare_presenter(AcquisitionPresenter, from_config="acq_ctrl")
@@ -61,6 +63,28 @@ def run_simulation_container() -> None:
         det_widget = declare_view(DetectorView, from_config="det_widget")
         light_widget = declare_view(LightView, from_config="light_widget")
         motor_widget = declare_view(MotorView, from_config="motor_widget")
-        storage_widget = declare_view(FileStorageView, from_config="storage_widget")
+        storage_widget = declare_view(StorageView, from_config="storage_widget")
 
-    MimirSimulator().run()
+        def wire(self) -> None:
+            wire_detector(self, self.det_ctrl, self.det_widget, self.img_widget)
+            wire_median(self, self.median_ctrl, self.img_widget)
+            wire_motor(self, self.motor_ctrl, self.motor_widget)
+            wire_light(self, self.light_ctrl, self.light_widget)
+            wire_acquisition(
+                self,
+                self.acq_ctrl,
+                self.acq_widget,
+                storage=self.storage_ctrl,
+                median=self.median_ctrl,
+            )
+
+    return MimirSimulator()
+
+
+def run_simulation_container() -> None:
+    """Run a local mock example.
+
+    Launches a simulation with the full stack
+    provided by mimir with mock devices.
+    """
+    build_simulation_container().run()

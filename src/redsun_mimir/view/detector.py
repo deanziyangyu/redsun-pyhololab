@@ -5,12 +5,13 @@ from typing import TYPE_CHECKING, Any
 from bluesky.protocols import Descriptor, Reading  # noqa: TC002
 from qtpy import QtWidgets
 from redsun.log import Loggable
-from redsun.utils import find_signals
 from redsun.utils.descriptors import parse_key
 from redsun.view import ViewPosition
 from redsun.view.qt import QtView
 from redsun.view.qt.treeview import DescriptorTreeView
-from redsun.virtual import Signal
+from redsun.virtual import Signal, slot
+
+from redsun_mimir.providers import DETECTOR_DESCRIPTORS, DETECTOR_READINGS
 
 if TYPE_CHECKING:
     from redsun.virtual import VirtualContainer
@@ -62,14 +63,14 @@ class DetectorView(QtView, Loggable):
 
     Attributes
     ----------
-    sigPropertyChanged : Signal[str, str, Any]
+    sig_property_changed : Signal[str, str, Any]
         Emitted when the user changes a detector property.
         - str: The detector name.
         - str: The property name.
         - Any: The new value of the property.
     """
 
-    sigPropertyChanged = Signal(str, str, object)
+    sig_property_changed = Signal(str, str, object)
 
     @property
     def view_position(self) -> ViewPosition:
@@ -100,13 +101,11 @@ class DetectorView(QtView, Loggable):
         container.register_signals(self)
 
     def inject_dependencies(self, container: VirtualContainer) -> None:
-        """Inject detector configuration from the DI container."""
-        descriptors: dict[str, Descriptor] = container.detector_descriptors()
-        readings: dict[str, Reading[Any]] = container.detector_readings()
-        self.setup_ui(descriptors, readings)
-        sigs = find_signals(container, ["sigConfigurationConfirmed"])
-        if "sigConfigurationConfirmed" in sigs:
-            sigs["sigConfigurationConfirmed"].connect(self._handle_configuration_result)
+        """Build the settings panels from the detector presenter's snapshots."""
+        self.setup_ui(
+            container.require(DETECTOR_DESCRIPTORS),
+            container.require(DETECTOR_READINGS),
+        )
 
     def setup_ui(
         self,
@@ -135,27 +134,30 @@ class DetectorView(QtView, Loggable):
             dev_readings = {k: v for k, v in readings.items() if k in dev_descriptors}
 
             widget = SettingsControlWidget(dev_descriptors, dev_readings, self)
-            widget.tree_view.sigPropertyChanged.connect(self.sigPropertyChanged)
+            widget.tree_view.sig_property_changed.connect(self.sig_property_changed)
             self.settings_controls[device_label] = widget
             self.settings_tab_widget.addTab(widget, device_label)
 
-    def _handle_configuration_result(
-        self, detector: str, setting_name: str, success: bool
-    ) -> None:
-        """Handle the result of a configuration change.
+    @slot
+    def on_new_configuration(self, detector: str, key: str, value: Any) -> None:
+        """Clear the pending edit for *key* once the presenter applied it.
+
+        [`DetectorPresenter`][redsun_mimir.presenter.DetectorPresenter] only
+        emits ``sig_new_configuration`` after a successful ``set``, so the
+        edit is always confirmed here; failures are logged by the presenter
+        and leave the pending value in place.
 
         Parameters
         ----------
-        detector :
-            Name of the detector.
-        setting_name :
-            Name of the setting that was attempted.
-        success :
-            Whether the change was applied successfully.
+        detector : str
+            Name of the detector that applied the change.
+        key : str
+            Canonical ``name-property`` key of the setting that was applied.
+        value : Any
+            New value read back from the device.
         """
-        if detector in self.settings_controls:
-            self.settings_controls[detector].tree_view.confirm_change(
-                setting_name, success
-            )
-            if not success:
-                self.logger.error(f"Failed to configure {setting_name} for {detector}")
+        widget = self.settings_controls.get(detector)
+        if widget is None:
+            self.logger.warning(f"No settings panel for detector {detector!r}")
+            return
+        widget.tree_view.confirm_change(key, True)

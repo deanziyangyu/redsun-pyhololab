@@ -8,17 +8,18 @@ from typing import TYPE_CHECKING
 
 from ophyd_async.core import (
     AsyncStatus,
+    DeviceMap,
+    StandardMovable,
     StandardReadable,
     StandardReadableFormat,
     soft_signal_r_and_setter,
     soft_signal_rw,
 )
 from redsun.aio import run_coro
-from redsun.device import DeviceMap
 from redsun.log import Loggable
 from serial import Serial
 
-from ._backend import uc2_axis_signal, uc2_laser_signal
+from ._backend import UC2Axis, uc2_laser_signal
 
 if TYPE_CHECKING:
     from typing import ClassVar
@@ -193,7 +194,7 @@ class UC2LaserDevice(StandardReadable, Loggable):
 class UC2MotorDevice(StandardReadable, Loggable):
     """UC2 motor device."""
 
-    axis: DeviceMap[SignalRW[float]]
+    axis: DeviceMap[StandardMovable[float]]
 
     def __init__(self, name: str) -> None:
         def _callback(future: Future[Serial]) -> None:
@@ -209,17 +210,17 @@ class UC2MotorDevice(StandardReadable, Loggable):
 
         lock = UC2Serial.get_lock()
 
-        with self.add_children_as_readables():
-            self.x = uc2_axis_signal(self._serial, "x", units="um", lock=lock)
-            self.y = uc2_axis_signal(self._serial, "y", units="um", lock=lock)
-            self.z = uc2_axis_signal(self._serial, "z", units="um", lock=lock)
+        # the signals live *only* in the map: assigning them to the device
+        # first would parent them here, and a Device cannot be re-parented
+        # into the DeviceMap afterwards. Readables come from the map's values
+        # so readings are keyed "<device>-axis-<name>" (parse_map_key).
         self.axis = DeviceMap(
             {
-                "x": self.x,
-                "y": self.y,
-                "z": self.z,
+                axis: UC2Axis(self._serial, axis, units="um", lock=lock)
+                for axis in ("x", "y", "z")
             }
         )
+        self.add_readables(list(self.axis.values()))
         super().__init__(name)
         run_coro(self._set_zero())
 
@@ -227,6 +228,5 @@ class UC2MotorDevice(StandardReadable, Loggable):
 
     async def _set_zero(self) -> None:
         """Set all axes to zero."""
-        await self.x.set(0)
-        await self.y.set(0)
-        await self.z.set(0)
+        for movable in self.axis.values():
+            await movable.set(0)
