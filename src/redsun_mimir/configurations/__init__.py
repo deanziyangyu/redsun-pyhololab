@@ -1,8 +1,9 @@
 from ._acquisition import run_acquisition_container
+from ._full_arh import run_arh_container
 from ._full_simulation import run_simulation_container
 from ._full_uc2 import run_uc2_container
-from ._full_arh import run_arh_container
 from ._light import run_light_container
+from ._mmcore_mock import run_mmcore_mock_container
 from ._motor import run_stage_container
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "run_light_container",
     "run_stage_container",
     "run_arh_container",
+    "run_mmcore_mock_container",
 ]

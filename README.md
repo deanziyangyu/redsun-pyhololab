@@ -117,6 +117,13 @@ mimir sim
 ```
 </details>
 
+For serial, shutter, and filter-wheel UI testing without Micro-Manager adapters
+or physical hardware, run:
+
+```bash
+mimir mmcore-mock
+```
+
 ## Features
 
 - Live data capture.

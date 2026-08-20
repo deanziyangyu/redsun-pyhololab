@@ -1,0 +1,30 @@
+schema_version: 1.0
+session: redsun-mimir-mmcore-mock
+frontend: pyqt
+
+devices:
+  serial:
+    port: MOCK_COM3
+    baudrate: 115200
+  serial25:
+    port: MOCK_COM25
+    baudrate: 9600
+  spectra:
+    port: serial25
+    setle_type: SpectraX
+  fw_controller:
+    port: serial
+  filterwheel:
+    wheel_number: 0
+    num_positions: 8
+    initial_position: 3
+
+presenters:
+  light_ctrl:
+    timeout: 2.0
+  fw_ctrl:
+    timeout: 2.0
+
+views:
+  light_widget: {}
+  fw_widget: {}

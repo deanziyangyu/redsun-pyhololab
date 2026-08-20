@@ -13,6 +13,10 @@ devices:
 
   # mock devices
   mock-light: redsun_mimir.device:MockLightDevice
+  mock-mmcore-serial: redsun_mimir.device.mmcore:MockMMSerialDevice
+  mock-mmcore-filterwheel: redsun_mimir.device.mmcore:MockMMASIFilterWheel
+  mock-mmcore-fw-controller: redsun_mimir.device.mmcore:MockMMASIFWController
+  mock-mmcore-spectra: redsun_mimir.device.mmcore:MockMMSpectraShutteredDevice
 
 presenters:
   acquisition: redsun_mimir.presenter.acquisition:AcquisitionPresenter

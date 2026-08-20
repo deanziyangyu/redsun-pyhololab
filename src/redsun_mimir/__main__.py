@@ -20,6 +20,10 @@ def main() -> None:
     subparsers.add_parser("motor", help="Run the mock motor example")
     subparsers.add_parser("light", help="Run the mock light example")
     subparsers.add_parser(
+        "mmcore-mock",
+        help="Run hardware-free MMCore serial, shutter, and filter-wheel controls",
+    )
+    subparsers.add_parser(
         "acquisition",
         help="Run the example acquisition container",
     )
@@ -37,6 +41,8 @@ def main() -> None:
         configurations.run_stage_container()
     elif options.command == "light":
         configurations.run_light_container()
+    elif options.command == "mmcore-mock":
+        configurations.run_mmcore_mock_container()
     elif options.command == "acquisition":
         configurations.run_acquisition_container()
     elif options.command == "arh":
